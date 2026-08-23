@@ -35,7 +35,14 @@ from __future__ import annotations
 
 import argparse
 import base64
-import fcntl
+try:                 # POSIX advisory locks — absent on Windows.
+    import fcntl
+except ImportError:  # pragma: no cover - platform-dependent
+    fcntl = None
+try:                 # Windows byte-range locks — absent everywhere else.
+    import msvcrt
+except ImportError:  # pragma: no cover - platform-dependent
+    msvcrt = None
 import hashlib
 import http.server
 import json
@@ -59,13 +66,14 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-__version__ = "0.23.4"
+__version__ = "0.23.5"
 
 # What's-new, newest first — one terse line per release. The update reminder
 # surfaces these so a user learns WHAT changed, not just that a newer version
 # exists. Kept as flat, easy-to-regex comments near the top so the remote copy
 # can be parsed from the same 8KB prefix the reminder already reads — no extra
 # file to drift, no import needed. Format: `# WHATSNEW[<version>]: <summary>`.
+# WHATSNEW[0.23.5]: Windows 上不再一启动就崩——fcntl 改为可选导入,并用 msvcrt 字节锁顶上,并发闸门在 Windows 上依旧生效,不会退化成不限并发
 # WHATSNEW[0.23.4]: agy 后端不再把启动耗时当成卡死——首行输出前有 5 秒宽限,短 --stall-timeout 不会再误杀刚开机的 agy;卡死提示改报真实静默秒数,不再显示 "~0s"
 # WHATSNEW[0.23.3]: --stall-timeout 0 不再被 argparse 拒绝——卡死提示里教你用的 0 现在真能用,表示关掉静默检测、等满 --timeout;负数仍然报错
 # WHATSNEW[0.23.2]: `chatgpt-imagegen update` 在没装全局 skills 时改走 npx,不再只甩一句自己也跑不了的命令;文档里的升级指引同步改成 `chatgpt-imagegen update`
@@ -1613,6 +1621,44 @@ WEB_CONCURRENCY_DEFAULT = 1
 CODEX_CONCURRENCY_DEFAULT = 4
 
 
+# Whether this platform gives us a cross-process file lock at all. Both
+# primitives are kernel-owned, so a slot is released when its holder dies —
+# that is the property the queue below relies on.
+_HAVE_FILE_LOCK = fcntl is not None or msvcrt is not None
+
+
+def _try_lock(f) -> bool:
+    """Take an exclusive non-blocking lock on ``f``; False if someone holds it.
+
+    ``fcntl.flock`` locks the whole file; ``msvcrt.locking`` locks a byte range
+    from the current offset, so we pin both to byte 0 and lock one byte. Only
+    called when :data:`_HAVE_FILE_LOCK` — a False here always means contention,
+    never a missing primitive.
+    """
+    try:
+        if fcntl is not None:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        else:
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        return True
+    except OSError:
+        return False
+
+
+def _unlock(f) -> None:
+    """Release a lock taken by :func:`_try_lock`. Best-effort: closing the file
+    (and exiting the process) drops it anyway."""
+    try:
+        if fcntl is not None:
+            fcntl.flock(f, fcntl.LOCK_UN)
+        else:
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+    except OSError:
+        pass
+
+
 @contextmanager
 def _concurrency_slot(kind: str, limit: int, progress: bool, start: float) -> "Iterator[None]":
     """Cross-process counting semaphore: at most ``limit`` concurrent runs.
@@ -1622,9 +1668,10 @@ def _concurrency_slot(kind: str, limit: int, progress: bool, start: float) -> "I
     instead of failing or corrupting each other (issue #7: parallel web runs
     cross-contaminated images; the page surface also rate-limits hard). The
     kernel releases a slot when its holder dies, so a crash can't wedge the
-    queue. ``limit <= 0`` disables the gate entirely.
+    queue. ``limit <= 0`` disables the gate entirely, as does a platform with
+    no file-locking primitive at all (see :data:`_HAVE_FILE_LOCK`).
     """
-    if limit <= 0:
+    if limit <= 0 or not _HAVE_FILE_LOCK:
         yield
         return
     base = tempfile.gettempdir()
@@ -1633,13 +1680,13 @@ def _concurrency_slot(kind: str, limit: int, progress: bool, start: float) -> "I
     try:
         while slot is None:
             for i in range(limit):
-                f = open(os.path.join(base, f"chatgpt-imagegen-{kind}-{i}.lock"), "w")
-                try:
-                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                # "a+" not "w": truncating a slot file another process has
+                # byte-range-locked is a sharing violation on Windows.
+                f = open(os.path.join(base, f"chatgpt-imagegen-{kind}-{i}.lock"), "a+")
+                if _try_lock(f):
                     slot = f
                     break
-                except OSError:
-                    f.close()
+                f.close()
             else:
                 if progress and not announced:
                     announced = True
@@ -1653,10 +1700,7 @@ def _concurrency_slot(kind: str, limit: int, progress: bool, start: float) -> "I
         yield
     finally:
         if slot is not None:
-            try:
-                fcntl.flock(slot, fcntl.LOCK_UN)
-            except OSError:
-                pass
+            _unlock(slot)
             slot.close()
 
 

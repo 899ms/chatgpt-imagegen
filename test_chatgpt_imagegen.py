@@ -2241,5 +2241,96 @@ class StallTimeoutZero(unittest.TestCase):
         self.assertIn("drop it to 0 to wait out the", src)
 
 
+class ConcurrencySlot(unittest.TestCase):
+    """The cross-process gate must survive platforms without ``fcntl``.
+
+    Importing ``fcntl`` at module scope used to abort the whole CLI on Windows
+    (PR #31) — even ``--version``. It is optional now, and Windows gets a real
+    lock via ``msvcrt`` rather than silently losing the gate that issue #7
+    added to stop parallel web runs cross-contaminating each other.
+    """
+
+    def test_the_posix_import_is_optional(self):
+        src = Path(cig.__file__).read_text()
+        self.assertNotIn("\nimport fcntl\n", src)   # bare import would crash
+        self.assertIn("except ImportError:", src)
+
+    def test_a_second_holder_is_made_to_queue(self):
+        # Two nested entries with limit=1: the inner one can't get the only
+        # slot, so it polls. Assert it does by watching the sleep it polls on.
+        if not cig._HAVE_FILE_LOCK:
+            self.skipTest("no file-locking primitive on this platform")
+        kind = "test-%d" % os.getpid()
+        slept = []
+        with cig._concurrency_slot(kind, 1, False, time.monotonic()):
+            real_sleep = time.sleep
+
+            def fake_sleep(s):          # let the inner attempt spin once, then
+                slept.append(s)         # free the slot so it can proceed
+                raise _Escape()
+
+            with unittest.mock.patch.object(time, "sleep", fake_sleep):
+                with self.assertRaises(_Escape):
+                    with cig._concurrency_slot(kind, 1, False, time.monotonic()):
+                        pass
+            real_sleep(0)
+        self.assertTrue(slept, "second holder took the slot instead of queueing")
+
+    def test_the_slot_is_reusable_once_released(self):
+        if not cig._HAVE_FILE_LOCK:
+            self.skipTest("no file-locking primitive on this platform")
+        kind = "test-reuse-%d" % os.getpid()
+        for _ in range(3):              # a released slot must be retakeable
+            with cig._concurrency_slot(kind, 1, False, time.monotonic()):
+                pass
+
+    def test_it_degrades_to_a_no_op_without_any_lock_primitive(self):
+        # Neither fcntl nor msvcrt: run ungated rather than hang or crash.
+        with unittest.mock.patch.object(cig, "_HAVE_FILE_LOCK", False):
+            with unittest.mock.patch.object(time, "sleep",
+                                            lambda s: self.fail("queued")):
+                with cig._concurrency_slot("nolock", 1, False, time.monotonic()):
+                    pass
+
+    def test_the_windows_path_locks_one_byte_at_offset_zero(self):
+        # msvcrt.locking() acts on the CURRENT offset, so _try_lock must pin it
+        # to 0 — otherwise two runs lock different bytes and both "win".
+        calls = []
+        fake_msvcrt = unittest.mock.Mock(LK_NBLCK=1, LK_UNLCK=0)
+        fake_msvcrt.locking.side_effect = lambda fd, mode, n: calls.append(
+            (mode, n, handle.tell()))
+        with tempfile.NamedTemporaryFile(suffix=".lock") as tf:
+            handle = open(tf.name, "a+")
+            handle.write("padding")     # a non-zero offset to be corrected
+            with unittest.mock.patch.object(cig, "fcntl", None), \
+                 unittest.mock.patch.object(cig, "msvcrt", fake_msvcrt):
+                self.assertTrue(cig._try_lock(handle))
+                cig._unlock(handle)
+            handle.close()
+        self.assertEqual(calls, [(1, 1, 0), (0, 1, 0)])
+
+    def test_the_windows_path_reports_contention_as_false(self):
+        fake_msvcrt = unittest.mock.Mock(LK_NBLCK=1, LK_UNLCK=0)
+        fake_msvcrt.locking.side_effect = OSError(36, "already locked")
+        with tempfile.NamedTemporaryFile(suffix=".lock") as tf:
+            handle = open(tf.name, "a+")
+            with unittest.mock.patch.object(cig, "fcntl", None), \
+                 unittest.mock.patch.object(cig, "msvcrt", fake_msvcrt):
+                self.assertFalse(cig._try_lock(handle))
+                cig._unlock(handle)     # must swallow the error, not raise
+            handle.close()
+
+    def test_slot_files_are_opened_without_truncating(self):
+        # "w" truncates, and truncating a byte-range-locked file is a sharing
+        # violation on Windows — the open mode must stay "a+".
+        src = inspect.getsource(cig._concurrency_slot)
+        self.assertIn('.lock"), "a+")', src)
+        self.assertNotIn('.lock"), "w")', src)
+
+
+class _Escape(Exception):
+    """Sentinel used to break out of the slot poll loop under test."""
+
+
 if __name__ == "__main__":
     unittest.main()
