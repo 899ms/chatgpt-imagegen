@@ -160,6 +160,72 @@ class UpdateNotify(unittest.TestCase):
                 os.environ.pop("CHATGPT_IMAGEGEN_NO_UPDATE_CHECK", None)
             self.assertEqual((counter["n"], msgs), (0, []))
 
+    def test_interactive_run_auto_updates_newer_version(self):
+        class _Res:
+            returncode = 0
+
+        calls = []
+
+        def fake_run(argv, *args, **kwargs):
+            calls.append((argv, kwargs))
+            return _Res()
+
+        with _tmp_xdg(), \
+             self._patched_fetch("9.9.9", {"9.9.9": "shiny new thing"}), \
+             unittest.mock.patch.object(cig, "_update_runner",
+                                        return_value=["skills", "update", "chatgpt-imagegen"]), \
+             unittest.mock.patch.object(cig, "_installed_script_version",
+                                        return_value="9.9.9"), \
+             unittest.mock.patch.object(cig.subprocess, "run", fake_run):
+            msgs = []
+            cig._maybe_notify_update(msgs.append, auto_update=True)
+
+        self.assertEqual(calls[0][0], ["skills", "update", "chatgpt-imagegen"])
+        self.assertIs(calls[0][1]["stdout"], cig.subprocess.DEVNULL)
+        self.assertIn("正在自动升级", msgs[0])
+        self.assertIn("已自动升级到 v9.9.9", msgs[1])
+        self.assertNotIn("更新:chatgpt-imagegen update", "\n".join(msgs))
+
+    def test_auto_update_failure_falls_back_to_notice(self):
+        class _Res:
+            returncode = 1
+
+        with _tmp_xdg(), self._patched_fetch("9.9.9", {"9.9.9": "change"}), \
+             unittest.mock.patch.object(cig, "_update_runner",
+                                        return_value=["skills", "update", "chatgpt-imagegen"]), \
+             unittest.mock.patch.object(cig.subprocess, "run", return_value=_Res()):
+            msgs = []
+            cig._maybe_notify_update(msgs.append, auto_update=True)
+
+        self.assertIn("正在自动升级", msgs[0])
+        self.assertIn("更新:chatgpt-imagegen update", msgs[-1])
+
+    def test_update_that_does_not_replace_this_cli_falls_back_to_notice(self):
+        class _Res:
+            returncode = 0
+
+        with _tmp_xdg(), self._patched_fetch("9.9.9", {"9.9.9": "change"}), \
+             unittest.mock.patch.object(cig, "_update_runner",
+                                        return_value=["skills", "update", "chatgpt-imagegen"]), \
+             unittest.mock.patch.object(cig, "_installed_script_version",
+                                        return_value=cig.__version__), \
+             unittest.mock.patch.object(cig.subprocess, "run", return_value=_Res()):
+            msgs = []
+            cig._maybe_notify_update(msgs.append, auto_update=True)
+
+        self.assertIn("更新:chatgpt-imagegen update", msgs[-1])
+
+    def test_no_auto_update_keeps_notice_without_running(self):
+        with _tmp_xdg(), self._patched_fetch("9.9.9", {"9.9.9": "change"}), \
+             unittest.mock.patch.dict(
+                 os.environ, {"CHATGPT_IMAGEGEN_NO_AUTO_UPDATE": "1"}), \
+             unittest.mock.patch.object(cig, "_update_runner") as runner:
+            msgs = []
+            cig._maybe_notify_update(msgs.append, auto_update=True)
+
+        runner.assert_not_called()
+        self.assertIn("更新:chatgpt-imagegen update", msgs[0])
+
     def test_changes_since_filters_and_orders(self):
         notes = {"0.1.0": "old", "9.9.0": "mid", "9.9.9": "new"}
         self.assertEqual(cig._changes_since(notes, base="9.8.0"),

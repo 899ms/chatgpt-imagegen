@@ -66,13 +66,14 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-__version__ = "0.23.5"
+__version__ = "0.23.6"
 
 # What's-new, newest first — one terse line per release. The update reminder
 # surfaces these so a user learns WHAT changed, not just that a newer version
 # exists. Kept as flat, easy-to-regex comments near the top so the remote copy
 # can be parsed from the same 8KB prefix the reminder already reads — no extra
 # file to drift, no import needed. Format: `# WHATSNEW[<version>]: <summary>`.
+# WHATSNEW[0.23.6]: Windows 认证持久化与路径测试可跨平台运行(#32);main 上版本变化且 CI 通过后自动创建 GitHub Release;交互式运行每天检查到新版时自动升级,失败则保留手动升级提示
 # WHATSNEW[0.23.5]: Windows 上不再一启动就崩——fcntl 改为可选导入,并用 msvcrt 字节锁顶上,并发闸门在 Windows 上依旧生效,不会退化成不限并发
 # WHATSNEW[0.23.4]: agy 后端不再把启动耗时当成卡死——首行输出前有 5 秒宽限,短 --stall-timeout 不会再误杀刚开机的 agy;卡死提示改报真实静默秒数,不再显示 "~0s"
 # WHATSNEW[0.23.3]: --stall-timeout 0 不再被 argparse 拒绝——卡死提示里教你用的 0 现在真能用,表示关掉静默检测、等满 --timeout;负数仍然报错
@@ -135,11 +136,11 @@ FALLBACK_UA = f"codex_cli_rs/{FALLBACK_VERSION} (Mac OS 26.0.1; arm64) chatgpt-i
 AUTH_PATH = Path.home() / ".codex" / "auth.json"
 VERSION_PATH = Path.home() / ".codex" / "version.json"
 
-# Self-update reminder. `skills add` has no auto-update and surfaces no "new
-# version" notice, so we do it ourselves: once a day, best-effort, read the
-# script's own `__version__` on main (the single source of truth — no separate
-# VERSION file to drift) and soft-notify if it's newer. Never blocks, never
-# touches stdout, silenced by `--no-progress` or CHATGPT_IMAGEGEN_NO_UPDATE_CHECK.
+# Self-update check. `skills add` has no auto-update, so interactive runs check
+# main once a day and ask the existing skills manager to refresh the install.
+# Failure degrades to the old soft notice. It never touches stdout and is
+# silenced by `--no-progress` or CHATGPT_IMAGEGEN_NO_UPDATE_CHECK; users can keep
+# the check/notice but disable installation with CHATGPT_IMAGEGEN_NO_AUTO_UPDATE.
 UPDATE_CHECK_URL = (
     "https://raw.githubusercontent.com/leeguooooo/chatgpt-imagegen/main/chatgpt-imagegen"
 )
@@ -4007,9 +4008,23 @@ def _format_update_notice(latest: str, notes: dict, max_lines: int = 3) -> str:
     return "\n".join(lines)
 
 
-def _maybe_notify_update(emit) -> None:
-    """Once a day, soft-notify via ``emit`` if a newer version is on main —
-    including a terse list of what changed since the installed version.
+def _installed_script_version() -> str | None:
+    """Version currently stored at the path this process was launched from."""
+    try:
+        head = Path(__file__).read_text(encoding="utf-8")[:8192]
+    except OSError:
+        return None
+    match = re.search(r'^__version__\s*=\s*"([\d.]+)"', head, re.MULTILINE)
+    return match.group(1) if match else None
+
+
+def _maybe_notify_update(emit, *, auto_update: bool = False) -> None:
+    """Once a day, handle a newer version found on main.
+
+    Interactive callers pass ``auto_update=True``: use the same skills-manager
+    path as the explicit ``update`` command and fall back to the ordinary notice
+    if the runner is missing or fails. Tests and other callers default to the
+    original notice-only behavior.
 
     Caches the result (timestamp, latest version, and the what's-new notes)
     under the config dir so normal runs do no network at all between daily
@@ -4038,8 +4053,26 @@ def _maybe_notify_update(emit) -> None:
         except Exception:  # noqa: BLE001
             pass
 
-    if latest and _version_tuple(latest) > _version_tuple(__version__):
-        emit(_format_update_notice(latest, notes))
+    if not latest or _version_tuple(latest) <= _version_tuple(__version__):
+        return
+
+    if auto_update and not os.environ.get("CHATGPT_IMAGEGEN_NO_AUTO_UPDATE"):
+        argv = _update_runner()
+        if argv:
+            emit(f"检测到 chatgpt-imagegen {latest},正在自动升级…")
+            try:
+                result = subprocess.run(
+                    argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                    text=True, timeout=120)
+            except (OSError, subprocess.TimeoutExpired):
+                result = None
+            installed = _installed_script_version()
+            if (result is not None and result.returncode == 0 and installed
+                    and _version_tuple(installed) >= _version_tuple(latest)):
+                emit(f"已自动升级到 v{latest};本次仍使用 v{__version__},下次运行生效。")
+                return
+
+    emit(_format_update_notice(latest, notes))
 
 
 def _default_styles_doc() -> dict:
@@ -5251,11 +5284,13 @@ def main() -> int:
             f"attaching the first {REF_ATTACH_CAP} (character-first), dropped: "
             f"{names}"), file=sys.stderr)
 
-    # One-line, once-a-day update nudge. Stderr only (stdout stays exactly the
-    # saved path), and skipped under --quiet/--no-progress so machine callers
-    # stay clean. `doctor` checks unconditionally for a deliberate look.
+    # Once-a-day auto-update for interactive runs. Stderr only (stdout stays
+    # exactly the saved path), and skipped under --quiet/--no-progress so machine
+    # callers stay deterministic. `doctor` checks unconditionally for a deliberate
+    # look; failures here degrade to the previous one-line update notice.
     if progress and not args.quiet:
-        _maybe_notify_update(lambda m: print(_yellow(m), file=sys.stderr))
+        _maybe_notify_update(
+            lambda m: print(_yellow(m), file=sys.stderr), auto_update=True)
 
     if progress:
         prompt_preview = f"{args.prompt[:60]}{'…' if len(args.prompt) > 60 else ''}"

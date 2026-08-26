@@ -46,7 +46,7 @@ sudo install chatgpt-imagegen/chatgpt-imagegen /usr/local/bin/chatgpt-imagegen
 chatgpt-imagegen update
 ```
 
-它会替你调用 `skills` 管理器——PATH 上有 `skills` 就直接用,没有则走 `npx`(通常都没有)。另外 CLI 每天最多提醒你一次有新版,并列出你那版之后改了什么;`CHATGPT_IMAGEGEN_NO_UPDATE_CHECK=1` 可以关掉。
+它会替你调用 `skills` 管理器——PATH 上有 `skills` 就直接用,没有则走 `npx`(通常都没有)。交互式运行每天最多检查一次新版并自动升级,下次运行生效;失败时会退回提醒并列出变更。`CHATGPT_IMAGEGEN_NO_AUTO_UPDATE=1` 只关闭自动安装,`CHATGPT_IMAGEGEN_NO_UPDATE_CHECK=1` 连检查也关闭。`--quiet`/`--no-progress` 不会在后台升级。
 
 **还停在 0.23.1 或更早?** 那时的自升级只找全局 `skills`,找不到就放弃,所以它没法把这个修复本身装进来。先手动破一次局:
 

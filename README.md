@@ -46,7 +46,7 @@ Got a **Gemini** subscription too? Two more backends use it instead of OpenAI: `
 chatgpt-imagegen update
 ```
 
-It runs the `skills` manager for you — directly when `skills` is on PATH, through `npx` when it isn't (it usually isn't). The CLI also nudges you at most once a day when a newer version exists, listing what changed since yours; `CHATGPT_IMAGEGEN_NO_UPDATE_CHECK=1` turns that off.
+It runs the `skills` manager for you — directly when `skills` is on PATH, through `npx` when it isn't (it usually isn't). Interactive runs check for a newer version at most once a day and upgrade automatically for the next run; failures fall back to a notice listing what changed. `CHATGPT_IMAGEGEN_NO_AUTO_UPDATE=1` disables installation but keeps the check and notice, while `CHATGPT_IMAGEGEN_NO_UPDATE_CHECK=1` disables both. `--quiet`/`--no-progress` never upgrades in the background.
 
 **On 0.23.1 or earlier?** That self-update only looked for a global `skills` and gave up when it was missing, so it cannot deliver its own fix. Bootstrap once with:
 
