@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Verify matching release versions
+        id: version
+        shell: python
+        run: |
+          import os
+          import re
+          from pathlib import Path
+
+          cli = Path("chatgpt-imagegen").read_text(encoding="utf-8")
+          skill = Path("SKILL.md").read_text(encoding="utf-8")
+          cli_match = re.search(r'^__version__\s*=\s*"([\d.]+)"', cli, re.MULTILINE)
+          skill_match = re.search(r'^version:\s*"([\d.]+)"', skill, re.MULTILINE)
+          if not cli_match or not skill_match:
+              raise SystemExit("could not read versions from chatgpt-imagegen and SKILL.md")
+          cli_version = cli_match.group(1)
+          skill_version = skill_match.group(1)
+          if cli_version != skill_version:
+              raise SystemExit(
+                  f"version mismatch: CLI={cli_version}, SKILL.md={skill_version}")
+          if not re.search(rf'^# WHATSNEW\[{re.escape(cli_version)}\]:\s*\S',
+                           cli, re.MULTILINE):
+              raise SystemExit(f"missing WHATSNEW entry for {cli_version}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print(f"version={cli_version}", file=output)
+
+      - name: Check whether the version is already released
+        id: tag
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/v${VERSION}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Validate the release candidate
+        if: steps.tag.outputs.exists == 'false'
+        run: |
+          python -m py_compile chatgpt-imagegen
+          python -m unittest test_chatgpt_imagegen -v
+
+      - name: Create tag and GitHub Release
+        if: steps.tag.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TARGET_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: >-
+          gh release create "v${VERSION}"
+          --repo "$GITHUB_REPOSITORY"
+          --target "$TARGET_SHA"
+          --title "v${VERSION}"
+          --generate-notes
