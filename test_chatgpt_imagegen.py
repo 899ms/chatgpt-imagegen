@@ -2410,6 +2410,236 @@ class ConcurrencySlot(unittest.TestCase):
         self.assertNotIn('.lock"), "w")', src)
 
 
+class ChatgptWebTurnLock(unittest.TestCase):
+    """The cross-TOOL lock on the chatgpt.com page surface.
+
+    ``_concurrency_slot`` only serializes this program against itself. It never
+    saw chatgpt-use (leeguooooo/chatgpt-use), which held a lock of its own at a
+    different path — so both projects could drive one account at once, which
+    concatenates prompts in a shared composer and leaks a sibling tab's image
+    into this run (issue #7). Both projects now agree on ~/.chatgpt-web.lock,
+    held for a whole generation.
+    """
+
+    @contextmanager
+    def _lock_at(self, path):
+        with unittest.mock.patch.dict(
+            os.environ, {"CHATGPT_IMAGEGEN_WEB_LOCK": str(path)}
+        ):
+            yield
+
+    def test_the_default_path_is_owned_by_neither_project(self):
+        # Not ~/.chatgpt-imagegen/... and not ~/.chatgpt-use/... — a lock owned
+        # by one tool is one the other has no reason to honour.
+        with unittest.mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CHATGPT_IMAGEGEN_WEB_LOCK", None)
+            path = cig._chatgpt_web_lock_path()
+        self.assertEqual(path, Path.home() / ".chatgpt-web.lock")
+        self.assertEqual(cig.CHATGPT_WEB_LOCK, ".chatgpt-web.lock")
+
+    def test_a_second_holder_is_made_to_queue(self):
+        if not cig._HAVE_FILE_LOCK:
+            self.skipTest("no file-locking primitive on this platform")
+        slept = []
+        with tempfile.TemporaryDirectory() as td:
+            with self._lock_at(Path(td) / "chatgpt-web.lock"):
+                with cig._chatgpt_web_turn(False, time.monotonic()):
+                    real_sleep = time.sleep
+
+                    def fake_sleep(s):
+                        slept.append(s)
+                        raise _Escape()
+
+                    with unittest.mock.patch.object(time, "sleep", fake_sleep):
+                        with self.assertRaises(_Escape):
+                            with cig._chatgpt_web_turn(False, time.monotonic()):
+                                pass
+                    real_sleep(0)
+        self.assertTrue(slept, "a second turn ran concurrently instead of queueing")
+
+    def test_the_lock_is_reusable_once_released(self):
+        if not cig._HAVE_FILE_LOCK:
+            self.skipTest("no file-locking primitive on this platform")
+        with tempfile.TemporaryDirectory() as td:
+            with self._lock_at(Path(td) / "chatgpt-web.lock"):
+                for _ in range(3):
+                    with cig._chatgpt_web_turn(False, time.monotonic()):
+                        pass
+
+    def test_it_tracks_whether_the_lock_is_really_held(self):
+        # The session name depends on this: sharing one tab is only safe while
+        # turns are genuinely serialized, so "held" must never be optimistic.
+        if not cig._HAVE_FILE_LOCK:
+            self.skipTest("no file-locking primitive on this platform")
+        self.assertFalse(cig._chatgpt_web_lock_held)
+        with tempfile.TemporaryDirectory() as td:
+            with self._lock_at(Path(td) / "chatgpt-web.lock"):
+                with cig._chatgpt_web_turn(False, time.monotonic()):
+                    self.assertTrue(cig._chatgpt_web_lock_held)
+        self.assertFalse(cig._chatgpt_web_lock_held,
+                         "the flag outlived the lock")
+
+    def test_an_unopenable_lock_file_warns_and_still_generates(self):
+        # Refusing to generate because a lock file is unreachable would be a
+        # worse failure than losing serialization. It must not claim the lock.
+        with tempfile.TemporaryDirectory() as td:
+            missing = Path(td) / "no-such-dir" / "chatgpt-web.lock"
+            err = io.StringIO()
+            with self._lock_at(missing), redirect_stderr(err):
+                with unittest.mock.patch.object(
+                    time, "sleep", lambda s: self.fail("queued on a broken lock")
+                ):
+                    with cig._chatgpt_web_turn(False, time.monotonic()):
+                        ran = True
+        self.assertTrue(ran)
+        self.assertIn("warning", err.getvalue().lower())
+        self.assertFalse(cig._chatgpt_web_lock_held)
+
+    def test_without_a_lock_primitive_it_warns_instead_of_pretending(self):
+        err = io.StringIO()
+        with unittest.mock.patch.object(cig, "_HAVE_FILE_LOCK", False), \
+             redirect_stderr(err):
+            with unittest.mock.patch.object(time, "sleep",
+                                            lambda s: self.fail("queued")):
+                with cig._chatgpt_web_turn(False, time.monotonic()):
+                    pass
+        self.assertIn("warning", err.getvalue().lower())
+        self.assertFalse(cig._chatgpt_web_lock_held)
+
+    def test_the_waiter_announces_itself_on_stderr(self):
+        # A silent multi-minute stall is indistinguishable from a hang, and the
+        # user reads stderr.
+        if not cig._HAVE_FILE_LOCK:
+            self.skipTest("no file-locking primitive on this platform")
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as td:
+            with self._lock_at(Path(td) / "chatgpt-web.lock"):
+                with cig._chatgpt_web_turn(False, time.monotonic()):
+                    real_sleep = time.sleep
+
+                    def fake_sleep(s):
+                        raise _Escape()
+
+                    with unittest.mock.patch.object(time, "sleep", fake_sleep), \
+                         redirect_stderr(err):
+                        with self.assertRaises(_Escape):
+                            # progress=True — this is the announcing path
+                            with cig._chatgpt_web_turn(True, time.monotonic()):
+                                pass
+                    real_sleep(0)
+        self.assertIn("to finish its chatgpt turn", err.getvalue())
+
+    def test_the_holder_writes_its_name_for_the_other_side(self):
+        # chatgpt-use reads this to say WHO it is waiting for. Format agreed as
+        # `<tool> <pid>`.
+        if not cig._HAVE_FILE_LOCK:
+            self.skipTest("no file-locking primitive on this platform")
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "chatgpt-web.lock"
+            with self._lock_at(p):
+                with cig._chatgpt_web_turn(False, time.monotonic()):
+                    first = p.read_text(encoding="utf-8").splitlines()[0].split()
+        self.assertEqual(first[0], "chatgpt-imagegen")
+        self.assertEqual(int(first[1]), os.getpid())
+
+    def test_the_waiter_names_the_holder(self):
+        if not cig._HAVE_FILE_LOCK:
+            self.skipTest("no file-locking primitive on this platform")
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as td:
+            with self._lock_at(Path(td) / "chatgpt-web.lock"):
+                with cig._chatgpt_web_turn(False, time.monotonic()):
+                    real_sleep = time.sleep
+
+                    def fake_sleep(s):
+                        raise _Escape()
+
+                    with unittest.mock.patch.object(time, "sleep", fake_sleep), \
+                         redirect_stderr(err):
+                        with self.assertRaises(_Escape):
+                            with cig._chatgpt_web_turn(True, time.monotonic()):
+                                pass
+                    real_sleep(0)
+        self.assertIn("chatgpt-imagegen", err.getvalue())
+        self.assertIn(str(os.getpid()), err.getvalue())
+
+    def test_an_unnamed_or_foreign_holder_is_described_not_crashed_on(self):
+        # The warn-and-proceed paths leave the file EMPTY on purpose, and an old
+        # holder may predate the convention — neither is an error.
+        with tempfile.TemporaryDirectory() as td:
+            for content, expected in [
+                ("", "another chatgpt tool"),
+                ("\n", "another chatgpt tool"),
+                ("chatgpt-use 4321\n", "chatgpt-use (pid 4321)"),
+                ("chatgpt-use\n", "chatgpt-use"),          # bare tool name
+                ("garbage not-a-pid\n", "garbage"),        # first field only
+            ]:
+                p = Path(td) / "h.lock"
+                p.write_text(content, encoding="utf-8")
+                with open(p, "r+") as f:
+                    self.assertEqual(cig._chatgpt_web_holder(f), expected,
+                                     f"for {content!r}")
+
+    def test_a_longer_previous_holder_cannot_corrupt_our_line(self):
+        # We do not truncate (Windows sharing violation), so a longer remnant
+        # must land on line 2 rather than trailing our own name.
+        if not cig._HAVE_FILE_LOCK:
+            self.skipTest("no file-locking primitive on this platform")
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "chatgpt-web.lock"
+            p.write_text("some-very-long-previous-holder-name 999999999\n",
+                         encoding="utf-8")
+            with self._lock_at(p):
+                with cig._chatgpt_web_turn(False, time.monotonic()):
+                    with open(p, "r+") as f:
+                        holder = cig._chatgpt_web_holder(f)
+        self.assertEqual(holder, f"chatgpt-imagegen (pid {os.getpid()})")
+
+    def test_the_lock_file_is_never_truncated(self):
+        # Truncating a byte-range-locked file is a sharing violation on Windows.
+        src = inspect.getsource(cig._chatgpt_web_turn)
+        self.assertNotIn("truncate()", src)
+
+    def test_the_lock_file_is_opened_without_truncating_or_appending(self):
+        # O_TRUNC would be a Windows sharing violation on a locked file; O_APPEND
+        # would make seek(0) a no-op, so the holder name would be appended after
+        # a previous holder's line and readers would report a stale holder.
+        src = inspect.getsource(cig._chatgpt_web_turn)
+        self.assertIn("os.O_RDWR | os.O_CREAT", src)
+        self.assertNotIn("os.O_TRUNC", src)
+        self.assertNotIn("os.O_APPEND", src)
+        self.assertNotIn('open(path, "a+")', src)
+        self.assertNotIn('open(path, "w")', src)
+
+    def test_the_whole_generation_is_inside_the_lock(self):
+        # A lock held per HTTP call is worse than none: it looks safe while the
+        # composer is still shared. run_web must be called INSIDE the turn, and
+        # the turn must wrap the inner per-process slot, not the reverse.
+        src = inspect.getsource(cig._dispatch)
+        turn = src.index("_chatgpt_web_turn")
+        slot = src.index('_concurrency_slot("web"')
+        self.assertLess(turn, slot, "the cross-tool lock must be the OUTER gate")
+        self.assertIn("run_web(args, progress, start, refs=refs)", src)
+
+    def test_the_session_name_is_shared_and_stable(self):
+        # One tab for the machine: this tool and chatgpt-use both drive
+        # `chatgpt-web`. A pid suffix would defeat reuse and pile up tabs.
+        self.assertEqual(cig.CHATGPT_WEB_SESSION, "chatgpt-web")
+        self.assertNotIn("{os.getpid()}", cig.CHATGPT_WEB_SESSION)
+        src = inspect.getsource(cig.run_web)
+        # The stable name applies whenever the lock really serializes us, even
+        # if the user lifted the per-process concurrency cap.
+        self.assertIn("_chatgpt_web_lock_held or _backend_limit", src)
+        self.assertIn("session = CHATGPT_WEB_SESSION", src)
+
+    def test_gemini_is_not_gated_by_the_chatgpt_lock(self):
+        # gemini.google.com is a different surface on a different account —
+        # serializing it behind chatgpt.com would slow it down for nothing.
+        src = inspect.getsource(cig._dispatch)
+        gemini = src.index('_concurrency_slot("gemini"')
+        self.assertNotIn("_chatgpt_web_turn", src[:gemini])
+
+
 class _Escape(Exception):
     """Sentinel used to break out of the slot poll loop under test."""
 
