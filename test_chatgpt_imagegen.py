@@ -1891,6 +1891,116 @@ class StylePublish(unittest.TestCase):
         self.assertIn(b'name="ref[]"', body)
 
 
+class GalleryUpload(unittest.TestCase):
+    """Anonymous POST /api/uploads — `style upload` and `--upload`."""
+
+    def test_machine_id_default_and_override(self):
+        with unittest.mock.patch.object(cig.socket, "gethostname",
+                                        return_value="box.local"):
+            self.assertEqual(cig._upload_machine_id(),
+                             "box.local-chatgpt-imagegen")
+        with unittest.mock.patch.dict(
+                os.environ, {"CHATGPT_IMAGEGEN_MACHINE_ID": "fleet-7"}):
+            self.assertEqual(cig._upload_machine_id(), "fleet-7")
+
+    def test_read_upload_accepts_gif(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "anim.gif"
+            p.write_bytes(b"GIF89a" + b"\x00" * 32)
+            _, mime, _ = cig._read_upload_image(str(p))
+            self.assertEqual(mime, "image/gif")
+
+    def test_read_upload_rejects_non_image(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "x.txt"
+            p.write_text("nope")
+            with self.assertRaises(SystemExit):
+                cig._read_upload_image(str(p))
+
+    def test_posts_multipart_with_machine_header(self):
+        captured = {}
+
+        def fake(method, path, *, data=None, headers=None):
+            captured.update(method=method, path=path, data=data,
+                            headers=headers or {})
+            return {"upload": {"url": "https://drawstyle.leeguoo.com/img/x.png",
+                               "remaining_today": 7}}
+
+        with tempfile.TemporaryDirectory() as d:
+            img = _write_png(os.path.join(d, "out.png"))
+            with unittest.mock.patch.object(cig, "_platform_request", fake), \
+                 unittest.mock.patch.object(cig, "_upload_machine_id",
+                                            return_value="m-1"):
+                up = cig._upload_gallery_image(img, "candid-vacation-photography")
+        self.assertEqual(captured["method"], "POST")
+        self.assertEqual(captured["path"], "/api/uploads")
+        self.assertEqual(captured["headers"]["X-Drawstyle-Machine-Id"], "m-1")
+        self.assertIn(b"candid-vacation-photography", captured["data"])
+        self.assertIn(b'name="image"', captured["data"])
+        self.assertEqual(up["remaining_today"], 7)
+
+    def test_oversize_without_sips_fails_loudly(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "big.png"
+            p.write_bytes(b"\x89PNG\r\n\x1a\n"
+                          + b"\x00" * (cig.UPLOAD_MAX_BYTES + 1))
+            with unittest.mock.patch.object(cig, "_downscale_for_upload",
+                                            return_value=None):
+                with self.assertRaises(SystemExit) as cm:
+                    cig._upload_gallery_image(str(p), None)
+            self.assertIn("upload cap", str(cm.exception))
+
+    def test_oversize_is_downscaled_then_uploaded(self):
+        captured = {}
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "big.png"
+            p.write_bytes(b"\x89PNG\r\n\x1a\n"
+                          + b"\x00" * (cig.UPLOAD_MAX_BYTES + 1))
+            tiny = b"\xff\xd8\xff" + b"\x00" * 16
+
+            def fake(method, path, *, data=None, headers=None):
+                captured["data"] = data
+                return {"upload": {"url": "u", "remaining_today": 1}}
+
+            with unittest.mock.patch.object(cig, "_downscale_for_upload",
+                                            return_value=tiny), \
+                 unittest.mock.patch.object(cig, "_platform_request", fake):
+                cig._upload_gallery_image(str(p), None)
+        self.assertIn(b"image/jpeg", captured["data"])
+
+    def test_unexpected_response_errors(self):
+        with tempfile.TemporaryDirectory() as d:
+            img = _write_png(os.path.join(d, "o.png"))
+            with unittest.mock.patch.object(cig, "_platform_request",
+                                            return_value={"nope": 1}):
+                with self.assertRaises(SystemExit):
+                    cig._upload_gallery_image(img, None)
+
+    def test_resolve_slug_explicit_single_ambiguous(self):
+        self.assertEqual(cig._resolve_upload_slug("s", [], []), "s")
+        self.assertEqual(cig._resolve_upload_slug("", ["only"], []), "only")
+        self.assertEqual(cig._resolve_upload_slug("", [], ["online-1"]),
+                         "online-1")
+        with self.assertRaises(SystemExit):
+            cig._resolve_upload_slug("", [], [])
+        with self.assertRaises(SystemExit):
+            cig._resolve_upload_slug("", ["a", "b"], [])
+
+    def test_style_upload_subcommand(self):
+        with tempfile.TemporaryDirectory() as d:
+            img = _write_png(os.path.join(d, "o.png"))
+            err = io.StringIO()
+            with unittest.mock.patch.object(
+                    cig, "_platform_request",
+                    return_value={"upload": {"url": "https://x/img/y.png",
+                                             "remaining_today": 6}}), \
+                 redirect_stderr(err):
+                rc = cig._style_command(["upload", img, "--style", "foo"])
+            self.assertEqual(rc, 0)
+            self.assertIn("remaining today: 6", err.getvalue())
+            self.assertIn("https://x/img/y.png", err.getvalue())
+
+
 class PlatformAccessTokenRefreshFallback(unittest.TestCase):
     def _expired(self):
         cig._save_platform_auth({"access_token": "old", "refresh_token": "rt",

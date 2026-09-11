@@ -1,6 +1,6 @@
 ---
 name: "chatgpt-imagegen"
-version: "0.25.0"
+version: "0.26.0"
 description: >-
   Generate new raster images and looping GIF/WebP animations with the user's
   ChatGPT subscription through the local one-file chatgpt-imagegen CLI, without
@@ -147,6 +147,7 @@ Useful flags:
 | `--keep-tab` | (web) Leave the ChatGPT tab open after generating (default closes it). Useful for debugging. Implies `--keep-conversation`. |
 | `--keep-conversation` | (web) Keep the ChatGPT conversation after generating. **Default deletes it** (`PATCH is_visible:false`) so the run leaves no history — it's filed under the project only transiently. Also `CHATGPT_IMAGEGEN_KEEP_CONVERSATION=1`. |
 | `-o PATH` | Always use when you know where the file should go in the repo. |
+| `--upload [SLUG]` | After generating, post the image to a drawstyle style's **player gallery** (anonymous, no login; ≤5 MB/file, 10/machine/day) and print the public URL to stderr. Bare `--upload` uses the style applied to the run; pass a slug to name one. See [Styles & assets](#styles--assets). |
 | `--model NAME` | (codex only) The **driver** model that reads the prompt and calls the image tool — *not* the image model (the server renders with its own, observed `gpt-image-2-codex`). It bills the metered Codex bucket, so keep it on a fast/affordable Codex-account model: default `gpt-5.6-luna`, alternatives `gpt-reserve`, `gpt-5.3-codex-spark`. A frontier coding model (`gpt-6-astra`, …) just burns the bucket. Unsupported models auto-fall-back to `gpt-5.5`. Also `CHATGPT_IMAGEGEN_MODEL`. |
 | `--size 1024x1024` | Square icons / logos (verified) |
 | `--size 1536x1024` | Landscape hero banners, social cards (verified) |
@@ -226,6 +227,7 @@ chatgpt-imagegen "Pip ordering coffee" --style pip
 - `style pull <slug> [--as NAME]` downloads the style and pinned refs into the local library; generation stays offline afterward (best when you'll reuse a style repeatedly).
 - `style update [NAME]` checks pulled styles for newer platform versions.
 - `style publish NAME --category X --example IMG [--tag Y]...` submits a local style that turned out well. It opens account.leeguoo.com login when needed and sends the style for review.
+- `style upload <IMG> [--style SLUG]` pushes one finished image to a style's **player gallery** (`drawstyle.leeguoo.com/…/s/<slug>/generations`) — no login, ≤5 MB/file, 10 per machine per UTC day. Prints the public `/img/…` URL. The same thing is available as `--upload [SLUG]` on a normal generation, so you can render and post in one command.
 
 **Proactively offer to publish a good style.** When you have crafted a reusable style that works well — or the user says a generated look is great and wants it again later — suggest sharing it to the gallery so others (and the user's future self) can `style pull` it in one command. Publishing is one line (the most-recent generation becomes the example image):
 
@@ -234,6 +236,8 @@ chatgpt-imagegen style publish mystyle --category cute --from-last
 ```
 
 It prints a summary before uploading and a link to track approval. Note: **publishing needs a one-time browser login** (it opens automatically and caches the token); `style search` and `style pull` do **not** need login. Don't publish without the user's go-ahead — offer, then let them confirm.
+
+**Showing off a result (player gallery).** When the user just wants their picture on display next to a style — not a reusable preset — use the anonymous **player gallery** instead of `publish`: `chatgpt-imagegen style upload out.png --style <slug>`, or add `--upload` to the generation. No login, ≤5 MB (over-cap files are downscaled once via `sips`, then fail loudly if still too big), 10 uploads per machine per UTC day. The public `/img/…` URL is printed; it appears in that style's gallery and may be promoted to the cover by the site's admins. Offer it after a result the user likes — this is what makes the community galleries grow.
 
 Legacy `styles.json` files (text-only entries from older versions) keep working and upgrade automatically on the next change.
 

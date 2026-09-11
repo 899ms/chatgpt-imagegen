@@ -114,6 +114,7 @@ Browse and reuse art styles other people tuned — a public gallery at **[drawst
 chatgpt-imagegen "a fox barista" --style-online doodle  # generate with a gallery style, nothing saved
 chatgpt-imagegen style search "watercolor mascot"       # search the gallery
 chatgpt-imagegen style publish mystyle --category cute --from-last   # share yours (one-time login)
+chatgpt-imagegen style upload out.png --style doodle                 # show a result on the style's player gallery (no login)
 ```
 
 A style can pin a **character**, not just a look. Style assets carry reference images, so the same character comes back in a brand-new scene:
