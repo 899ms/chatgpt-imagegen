@@ -65,7 +65,10 @@ chatgpt-imagegen "换成另一个虚构的人" --composition-ref photo.jpg  # �
 chatgpt-imagegen "一个机器人吉祥物" --style doodle                  # 套用画廊风格(本地没有会自动拉取并保存)
 chatgpt-imagegen animate "小狗开心地摇尾巴" --style-online snoopy --also-gif
 OUT=$(chatgpt-imagegen "icon" --quiet)                             # 只拿路径(便于管道)
+chatgpt-imagegen "产品主图" --backend codex --image-model gpt-image-2.5-sunburst --quality xhigh
 ```
+
+最后一行是 GPT Image 2.5 的出图参数——`--image-model`(`sunburst` 精修 /`flare` 快而高质量)、`--quality`(`low`→`max`)、`--background transparent`、`--compression`、`--action`、`--partial-images`。这些**只对 codex 后端生效**(web/gemini 没这些控件),全部可选,且都是**请求**而非保证——保存时那行会打印后端实际用的 `model=`/`quality=`/`size=`,以它为准。
 
 下面三张都是上面这些命令直接出的图,没有后期修饰:
 
@@ -141,5 +144,5 @@ MIT —— 见 [LICENSE](./LICENSE)。
 <details>
 <summary>关键词</summary>
 
-用 ChatGPT 订阅生成图片、免费 ChatGPT 账号生图、ChatGPT Plus 生图工具、不用 API key 生图、gpt-image-2 用订阅、ChatGPT 订阅生图 CLI、Codex CLI 生图能力独立工具、给 AI agent 用的生图 skill、本地生图脚本、零依赖 Python 生图工具。
+用 ChatGPT 订阅生成图片、免费 ChatGPT 账号生图、ChatGPT Plus 生图工具、不用 API key 生图、gpt-image-2.5 用订阅、gpt-image-2 用订阅、ChatGPT 订阅生图 CLI、Codex CLI 生图能力独立工具、给 AI agent 用的生图 skill、本地生图脚本、零依赖 Python 生图工具。
 </details>

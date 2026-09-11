@@ -41,6 +41,8 @@ Codex CLI 内置的 `image_gen` 能力是一个原生 Responses-API 工具:
 // Codex CLI 发往 chatgpt.com/backend-api/codex/responses 的请求:
 {
   "model": "gpt-5.5",
+  // 该 tool 可选带 GPT Image 2.5 参数——model(gpt-image-2.5-sunburst/flare)、
+  // quality(low…xhigh/max)、background、output_compression、action、partial_images
   "tools": [{"type": "image_generation"}],
   "input": [{"role": "user", "content": [{"type":"input_text","text":"draw a cat"}]}],
   // ...

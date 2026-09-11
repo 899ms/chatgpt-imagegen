@@ -41,6 +41,8 @@ The Codex CLI's built-in `image_gen` skill is implemented as a native Responses-
 // Codex CLI's request to chatgpt.com/backend-api/codex/responses:
 {
   "model": "gpt-5.5",
+  // the tool optionally takes GPT Image 2.5 knobs — model (gpt-image-2.5-sunburst/flare),
+  // quality (low…xhigh/max), background, output_compression, action, partial_images
   "tools": [{"type": "image_generation"}],
   "input": [{"role": "user", "content": [{"type":"input_text","text":"draw a cat"}]}],
   // ...

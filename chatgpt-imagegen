@@ -66,13 +66,14 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-__version__ = "0.23.7"
+__version__ = "0.24.0"
 
 # What's-new, newest first — one terse line per release. The update reminder
 # surfaces these so a user learns WHAT changed, not just that a newer version
 # exists. Kept as flat, easy-to-regex comments near the top so the remote copy
 # can be parsed from the same 8KB prefix the reminder already reads — no extra
 # file to drift, no import needed. Format: `# WHATSNEW[<version>]: <summary>`.
+# WHATSNEW[0.24.0]: codex 后端补齐 GPT Image 2.5 的出图参数——新增 --image-model(sunburst/flare)、--quality(low…xhigh/max)、--background(transparent/opaque)、--compression、--action、--partial-images,全部可选、不设即沿用后端默认;成功行与请求行会打印真实的 model/quality/size,后端是否真的采纳一眼可查(订阅路径可能被服务端规范化)
 # WHATSNEW[0.23.7]: chatgpt.com 改为全机器单窗口——与 chatgpt-use 共用 ~/.chatgpt-web.lock 把整轮生成串起来,并共用 chrome-use 会话名 chatgpt-web,避免多开标签页触发限流、互相串图;排队时说明在等哪个工具(#33)
 # WHATSNEW[0.23.6]: Windows 认证持久化与路径测试可跨平台运行(#32);main 上版本变化且 CI 通过后自动创建 GitHub Release;交互式运行每天检查到新版时自动升级,失败则保留手动升级提示
 # WHATSNEW[0.23.5]: Windows 上不再一启动就崩——fcntl 改为可选导入,并用 msvcrt 字节锁顶上,并发闸门在 Windows 上依旧生效,不会退化成不限并发
@@ -720,6 +721,12 @@ def _build_payload(
     refs: list[tuple[str, str]] | None = None,
     n_character_refs: int = 0, n_style_refs: int = 0,
     n_composition_refs: int = 0,
+    image_model: str | None = None,
+    quality: str | None = None,
+    background: str | None = None,
+    output_compression: int | None = None,
+    action: str | None = None,
+    partial_images: int | None = None,
 ) -> JsonDict:
     """Build the codex/responses body. When `refs` (list of (b64, mime)) is
     given, attach each as an `input_image` content part ahead of the text and
@@ -727,6 +734,11 @@ def _build_payload(
 
     The instruction wording follows the character/style ref counts; `tool_choice`
     stays "required" whenever any reference is attached (including style-only).
+
+    The optional per-tool knobs (GPT Image 2.5, exposed as --image-model /
+    --quality / --background / --compression / --action / --partial-images) are
+    each omitted when unset, so the backend's own default applies and payloads
+    from callers that set none of them are unchanged.
     """
     user_text = _build_user_text(
         prompt, size, output_format,
@@ -736,6 +748,18 @@ def _build_payload(
     image_tool: JsonDict = {"type": "image_generation", "output_format": output_format}
     if size and size != "auto":
         image_tool["size"] = size
+    if image_model:
+        image_tool["model"] = image_model
+    if quality:
+        image_tool["quality"] = quality
+    if background:
+        image_tool["background"] = background
+    if output_compression is not None:
+        image_tool["output_compression"] = output_compression
+    if action:
+        image_tool["action"] = action
+    if partial_images:
+        image_tool["partial_images"] = partial_images
 
     if refs:
         content: list[JsonDict] = [
@@ -3042,6 +3066,71 @@ def _non_negative_int(value: str) -> int:
     return v
 
 
+def _compression_int(value: str) -> int:
+    """`--compression`: an integer percentage 0-100 for jpeg/webp output."""
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(
+            f"must be an integer 0-100: {value!r}")
+    if not 0 <= v <= 100:
+        raise argparse.ArgumentTypeError(
+            f"must be an integer 0-100: {value!r}")
+    return v
+
+
+def _partial_images_int(value: str) -> int:
+    """`--partial-images`: how many progressive previews to stream (1-3)."""
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(
+            f"must be an integer 1-3: {value!r}")
+    if not 1 <= v <= 3:
+        raise argparse.ArgumentTypeError(
+            f"must be an integer 1-3: {value!r}")
+    return v
+
+
+def _opt_int_env(name: str) -> str | None:
+    """An integer option's env default, returned as the raw string so
+    argparse's `type` converts it — or None when unset/blank, so an empty env
+    var is never handed to `int()`."""
+    v = os.environ.get(name, "").strip()
+    return v or None
+
+
+_IMAGE_AUTO_VALUES = {"", "auto", "default"}
+
+
+def _image_opt(value: str | None) -> str | None:
+    """Normalise a codex image-tool string option. '' / 'auto' / 'default' all
+    mean "let the backend choose", so they collapse to None and the field is
+    omitted from the request — payloads stay byte-identical for callers that
+    never set one."""
+    if value is None:
+        return None
+    v = value.strip()
+    return None if v.lower() in _IMAGE_AUTO_VALUES else v
+
+
+_CODEX_IMAGE_OPTION_FLAGS = (
+    ("image_model", "--image-model"),
+    ("quality", "--quality"),
+    ("background", "--background"),
+    ("compression", "--compression"),
+    ("action", "--action"),
+    ("partial_images", "--partial-images"),
+)
+
+
+def _codex_only_options(args: argparse.Namespace) -> list[str]:
+    """Flags the user set that the image tool can only honour on the codex
+    backend — web/gemini/agy have no such knobs."""
+    return [flag for attr, flag in _CODEX_IMAGE_OPTION_FLAGS
+            if getattr(args, attr, None) is not None]
+
+
 # ---------- animation sprite sheets ----------
 
 def _build_animation_prompt(prompt: str) -> str:
@@ -3342,10 +3431,17 @@ def run_codex(
 
     version = _detect_codex_version()
     n_char, n_style, n_comp = _ref_counts(args, refs)
-    payload = _build_payload(args.gen_prompt, args.size, args.format, args.model,
-                             refs=loaded_refs,
-                             n_character_refs=n_char, n_style_refs=n_style,
-                             n_composition_refs=n_comp)
+    payload = _build_payload(
+        args.gen_prompt, args.size, args.format, args.model,
+        refs=loaded_refs,
+        n_character_refs=n_char, n_style_refs=n_style,
+        n_composition_refs=n_comp,
+        image_model=getattr(args, "image_model", None),
+        quality=getattr(args, "quality", None),
+        background=getattr(args, "background", None),
+        output_compression=getattr(args, "compression", None),
+        action=getattr(args, "action", None),
+        partial_images=getattr(args, "partial_images", None))
 
     with _concurrency_slot("codex", _backend_limit("codex", CODEX_CONCURRENCY_DEFAULT),
                            progress, start):
@@ -3426,6 +3522,18 @@ def _dispatch(
         if progress:
             print(_fmt_progress(time.monotonic() - start, msg), file=sys.stderr)
 
+    _ignored = _codex_only_options(args)
+
+    def warn_ignored(backend: str) -> None:
+        # Deliberately NOT gated on `progress`: a silently dropped --quality is
+        # exactly the surprise that must survive --no-progress.
+        if _ignored:
+            print(_fmt_progress(
+                time.monotonic() - start,
+                f"warning: {', '.join(_ignored)} only take effect on "
+                f"--backend codex (ignored on {backend}); rerun with "
+                f"--backend codex to use them."), file=sys.stderr)
+
     # main() has already resolved the active asset set, partitioned it into
     # character/style groups, applied the total-ref cap, and stored the ordered
     # file list (asset refs + ad-hoc --ref) on args. Fall back to the raw --ref
@@ -3441,6 +3549,11 @@ def _dispatch(
 
     if args.backend == "codex":
         return run_codex(args, progress, stall_timeout, start, refs=refs)
+
+    # Any explicitly named non-codex backend cannot honour the image-tool knobs;
+    # say so once, before the vendor-specific branches below.
+    if _ignored and args.backend != "auto":
+        warn_ignored(args.backend)
 
     # The two Gemini surfaces are explicit-only: they are never reached from
     # `auto`. That is a deliberate choice, not an omission — they hit a
@@ -3489,7 +3602,7 @@ def _dispatch(
     try:
         with _chatgpt_web_turn(progress, start):
             with _concurrency_slot("web", web_limit, progress, start):
-                return run_web(args, progress, start, refs=refs)
+                result = run_web(args, progress, start, refs=refs)
     except WebUnavailable as e:
         if _codex_token_present():
             if _find_agent_browser() is None:
@@ -3520,6 +3633,10 @@ def _dispatch(
             f"{e}\n(web backend was reachable, so auto-mode did not fall back to "
             f"codex — rerun with --backend codex to use the Codex-usage path.)"
         )
+    # Web produced the image, so the codex-only knobs really were ignored (had
+    # web been unavailable, we'd be in the codex branch above).
+    warn_ignored("web (auto)")
+    return result
 
 
 # ── Style presets ──────────────────────────────────────────────────────────
@@ -5214,6 +5331,65 @@ def main() -> int:
     else:
         parser.add_argument("--format", default="png", choices=["png", "jpeg", "webp"])
     parser.add_argument("--model", default=os.environ.get("CHATGPT_IMAGEGEN_MODEL", "gpt-5.5"))
+    # GPT Image 2.5 tool knobs. All codex-only (the web/gemini surfaces expose
+    # no such controls), all optional: unset means "keep the backend default".
+    parser.add_argument(
+        "--image-model",
+        default=os.environ.get("CHATGPT_IMAGEGEN_IMAGE_MODEL"),
+        metavar="MODEL",
+        help="(codex backend) which GPT Image model the image_generation tool "
+             "runs — gpt-image-2.5-sunburst (precise editing) or "
+             "gpt-image-2.5-flare (fast, high quality); older gpt-image-2 / "
+             "gpt-image-1.5 / gpt-image-1 / gpt-image-1-mini also work. Omit "
+             "(or pass 'auto') for the backend default. Also settable via "
+             "CHATGPT_IMAGEGEN_IMAGE_MODEL. Subject to backend support: the "
+             "Codex OAuth path may normalise the model server-side.",
+    )
+    parser.add_argument(
+        "--quality",
+        choices=["auto", "low", "medium", "high", "xhigh", "max"],
+        default=os.environ.get("CHATGPT_IMAGEGEN_QUALITY"),
+        help="(codex backend) rendering quality for the image_generation "
+             "tool. 'xhigh' and 'max' require gpt-image-2.5-sunburst/flare "
+             "and are rejected by older models. Omit (or 'auto') for the "
+             "backend default. Also settable via CHATGPT_IMAGEGEN_QUALITY.",
+    )
+    parser.add_argument(
+        "--background",
+        choices=["auto", "transparent", "opaque"],
+        default=os.environ.get("CHATGPT_IMAGEGEN_BACKGROUND"),
+        help="(codex backend) background for the image_generation tool. "
+             "'transparent' needs png/webp (not jpeg). Omit (or 'auto') for "
+             "the backend default. Also settable via "
+             "CHATGPT_IMAGEGEN_BACKGROUND.",
+    )
+    parser.add_argument(
+        "--compression",
+        type=_compression_int,
+        default=_opt_int_env("CHATGPT_IMAGEGEN_COMPRESSION"),
+        metavar="0-100",
+        help="(codex backend) output compression percentage for jpeg/webp "
+             "(ignored for png). Also settable via "
+             "CHATGPT_IMAGEGEN_COMPRESSION.",
+    )
+    parser.add_argument(
+        "--action",
+        choices=["auto", "generate", "edit"],
+        default=os.environ.get("CHATGPT_IMAGEGEN_ACTION"),
+        help="(codex backend) force the image tool to generate a new image "
+             "('generate') or edit the attached reference(s) ('edit'); 'auto' "
+             "lets the model decide. Also settable via "
+             "CHATGPT_IMAGEGEN_ACTION.",
+    )
+    parser.add_argument(
+        "--partial-images",
+        type=_partial_images_int,
+        default=_opt_int_env("CHATGPT_IMAGEGEN_PARTIAL_IMAGES"),
+        metavar="1-3",
+        help="(codex backend) stream 1-3 progressive partial images while the "
+             "final image renders (they appear in the progress timeline). "
+             "Also settable via CHATGPT_IMAGEGEN_PARTIAL_IMAGES.",
+    )
     parser.add_argument(
         "-i", "--ref",
         action="append",
@@ -5372,6 +5548,10 @@ def main() -> int:
              "(macOS `open`, Linux `xdg-open`, Windows default). Best-effort.",
     )
     args = parser.parse_args(argv)
+    # '' / 'auto' / 'default' mean "backend decides" for the image-tool string
+    # knobs; collapse them to None once so every consumer agrees.
+    for _attr in ("image_model", "quality", "background", "action"):
+        setattr(args, _attr, _image_opt(getattr(args, _attr, None)))
     if animate_mode and args.max_drift < 0:
         parser.error("--max-drift must be zero or greater")
     if animate_mode:
@@ -5454,8 +5634,14 @@ def main() -> int:
     if progress:
         prompt_preview = f"{args.prompt[:60]}{'…' if len(args.prompt) > 60 else ''}"
         mode_bit = " animation-sprite" if animate_mode else ""
+        _opt_bit = ""
+        if getattr(args, "image_model", None):
+            _opt_bit += f" image-model={args.image_model}"
+        if getattr(args, "quality", None):
+            _opt_bit += f" quality={args.quality}"
         meta_bit = _dim(f"(backend={args.backend} size={args.size} "
-                        f"format={args.format} timeout={args.timeout}s)")
+                        f"format={args.format}{_opt_bit} "
+                        f"timeout={args.timeout}s)")
         print(_fmt_progress(0.0, f"requesting{mode_bit} image  {meta_bit}"), file=sys.stderr)
         print(_dim(f"           prompt: {prompt_preview}"), file=sys.stderr)
         _shown = list(_active) + [f"{s} (online)" for s in (args.style_online or [])]
@@ -5517,11 +5703,16 @@ def main() -> int:
     if progress:
         size_info = f"  size={meta.get('size')}" if meta.get("size") else ""
         quality_info = f"  quality={meta.get('quality')}" if meta.get("quality") else ""
+        # The image model is only reported by the codex tool metadata; printing
+        # it lets a caller verify the backend honoured --image-model (the Codex
+        # OAuth path has been observed normalising model/size/quality).
+        model_info = f"  model={meta.get('model')}" if meta.get("model") else ""
         print(
             _fmt_progress(
                 time.monotonic() - start,
                 _green(f"✓ saved → {out_path}")
-                + _dim(f"  ({len(image_bytes):,} bytes){size_info}{quality_info}"),
+                + _dim(f"  ({len(image_bytes):,} bytes)"
+                       f"{size_info}{quality_info}{model_info}"),
             ),
             file=sys.stderr,
         )

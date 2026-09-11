@@ -1123,6 +1123,52 @@ class PromptWordingByKind(unittest.TestCase):
         self.assertEqual(payload["tool_choice"], "required")
 
 
+class CodexImageToolOptions(unittest.TestCase):
+    """The GPT Image 2.5 knobs live inside the image_generation tool, and unset
+    ones are omitted so payloads from existing callers stay byte-identical."""
+
+    def _tool(self, size="auto", **kw):
+        return cig._build_payload(
+            "a cat", size, "png", "gpt-5.5", **kw)["tools"][0]
+
+    def test_unset_omits_every_knob(self):
+        tool = self._tool()
+        for field in ("model", "quality", "background",
+                      "output_compression", "action", "partial_images"):
+            self.assertNotIn(field, tool)
+        self.assertEqual(tool, {"type": "image_generation", "output_format": "png"})
+
+    def test_each_knob_lands_in_the_tool(self):
+        tool = self._tool(
+            image_model="gpt-image-2.5-sunburst", quality="xhigh",
+            background="transparent", output_compression=90,
+            action="edit", partial_images=2)
+        self.assertEqual(tool["model"], "gpt-image-2.5-sunburst")
+        self.assertEqual(tool["quality"], "xhigh")
+        self.assertEqual(tool["background"], "transparent")
+        self.assertEqual(tool["output_compression"], 90)
+        self.assertEqual(tool["action"], "edit")
+        self.assertEqual(tool["partial_images"], 2)
+
+    def test_size_auto_omitted_real_size_forwarded(self):
+        self.assertNotIn("size", self._tool(size="auto"))
+        self.assertEqual(self._tool(size="1024x1024")["size"], "1024x1024")
+
+    def test_image_opt_collapses_auto_values(self):
+        for v in (None, "", "  ", "auto", "AUTO", "default"):
+            self.assertIsNone(cig._image_opt(v))
+        self.assertEqual(cig._image_opt(" gpt-image-2.5-flare "),
+                         "gpt-image-2.5-flare")
+
+    def test_codex_only_options_reports_set_flags(self):
+        ns = argparse.Namespace(image_model=None, quality="high",
+                                background=None, compression=None,
+                                action=None, partial_images=None)
+        self.assertEqual(cig._codex_only_options(ns), ["--quality"])
+        ns.quality = None
+        self.assertEqual(cig._codex_only_options(ns), [])
+
+
 class StylesAlias(unittest.TestCase):
     def test_use_accepts_multiple(self):
         with _tmp_xdg():

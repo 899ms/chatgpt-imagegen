@@ -1,6 +1,6 @@
 ---
 name: "chatgpt-imagegen"
-version: "0.23.7"
+version: "0.24.0"
 description: >-
   Generate new raster images and looping GIF/WebP animations with the user's
   ChatGPT subscription through the local one-file chatgpt-imagegen CLI, without
@@ -96,7 +96,7 @@ That writes `~/.codex/auth.json`, which the codex backend reads. No `OPENAI_API_
 ## When to use
 
 - The user asks for a new photo, illustration, icon, hero banner, sprite, cover image, infographic, product mockup, concept art, or any other bitmap deliverable for the current project.
-- The user is happy with subscription-tier quality (`medium` quality, no native transparent backgrounds — see *Limits* below).
+- The user is happy with subscription-tier defaults (`auto` quality, no guaranteed transparency — see *Limits* below), or will opt into `--backend codex` with `--image-model` / `--quality` / `--background` when they need more control.
 - The deliverable is intended to be saved into the repo or build inputs.
 - You're authoring long-form or explanatory content — a blog post, technical proposal, design doc, tutorial, postmortem, or README — and a figure would help a concept land. **You don't need to be asked**: propose the figures and generate them (see *[Illustrating documents](#illustrating-documents)* below).
 
@@ -105,7 +105,7 @@ That writes `~/.codex/auth.json`, which the codex backend reads. No `OPENAI_API_
 - The user wants an SVG icon that matches an in-repo vector set — edit those instead.
 - The task is better solved with code (HTML/CSS, canvas, Mermaid, PlantUML).
 - The user wants an existing image **modified in place** — retouching, cropping, text/logo removal, upscaling, background knock-out. This skill always renders a *new* image; it cannot return an edited copy of the original's pixels. (Passing an image as a *reference* with `--ref` / `--style-ref` / `--composition-ref` is supported and encouraged — that's re-generation guided by the image, not editing it.)
-- The user explicitly needs **true `quality=high`** or **`background=transparent`** — the subscription path caps quality at `medium` and rejects transparent. Tell the user to use the official `/v1/images/generations` API with their `OPENAI_API_KEY` for those cases.
+- The user needs a **guaranteed** `quality=high` or a **true transparent** background. `--backend codex --quality high --background transparent` requests both, but the subscription backend may normalise them (the saved line prints what was actually used). For a guarantee, tell the user to use the official `/v1/images/generations` API with their `OPENAI_API_KEY`.
 - The deliverable will be served to end users (e.g. a public service generating images for visitors) — that violates OpenAI's ToS for personal subscriptions. Refuse and explain.
 
 ## How to invoke
@@ -152,6 +152,12 @@ Useful flags:
 | `--size 1024x1536` | Portrait covers, mobile splashes (verified) |
 | `--size 3840x2160` or similar | 4K landscape (forwarded as-is; backend may reject — fall back to a smaller verified size on failure) |
 | `--format webp` | Smaller files for web assets |
+| `--image-model MODEL` | (codex only) Pick the GPT Image model: `gpt-image-2.5-sunburst` (precise editing) or `gpt-image-2.5-flare` (fast, high quality); older `gpt-image-2` / `gpt-image-1.5` / `gpt-image-1` / `gpt-image-1-mini` also work. Unset = the backend's own default. Also `CHATGPT_IMAGEGEN_IMAGE_MODEL`. |
+| `--quality LEVEL` | (codex only) `low` \| `medium` \| `high` \| `xhigh` \| `max` — the last two require a 2.5 model (`--image-model`). A *request*, not a guarantee; verify with the `quality=` the tool prints on save. Also `CHATGPT_IMAGEGEN_QUALITY`. |
+| `--background auto` \| `transparent` \| `opaque` | (codex only) Transparent needs png/webp (not jpeg) and may be rejected by the subscription path. Also `CHATGPT_IMAGEGEN_BACKGROUND`. |
+| `--compression 0-100` | (codex only) jpeg/webp output compression (ignored for png). Also `CHATGPT_IMAGEGEN_COMPRESSION`. |
+| `--action auto` \| `generate` \| `edit` | (codex only) Force generate-vs-edit instead of letting the model choose; useful for `--ref` edits. Also `CHATGPT_IMAGEGEN_ACTION`. |
+| `--partial-images 1-3` | (codex only) Stream progressive previews into the progress timeline. Also `CHATGPT_IMAGEGEN_PARTIAL_IMAGES`. |
 | `--style NAME` | Apply a saved asset (a style snippet and/or pinned reference images). **Repeatable** — stack a character + a style, e.g. `--style mascot --style watercolor`. See [Styles & assets](#styles--assets). Overrides any active default set for this run. |
 | `--no-style` | Skip all assets (text *and* pinned refs) for this run even if the user set an active default. |
 | `--quiet` | Use in agent contexts so stdout is *only* the saved path. Progress still streams to stderr (use `--no-progress` to silence it). |
@@ -268,8 +274,7 @@ A vague prompt yields a useless figure. Make the prompt describe the figure's **
 
 ## Limits
 
-- **Image quality** is chosen by the backend; this skill has no `--quality` flag, and the subscription path does not honour explicit quality requests reliably. Don't promise a specific quality level to the user. If they need explicit `quality=high`, route them to the official `/v1/images/generations` API with their own `OPENAI_API_KEY`.
-- `background: transparent` is **not supported** on the subscription path.
+- **Image quality/background are backend-decided by default.** `--quality` (`low`/`medium`/`high`/`xhigh`/`max`) and `--background transparent`/`opaque` are **opt-in, codex-only** knobs (the web and gemini surfaces have no such controls and the CLI warns when you pass them anyway). `xhigh`/`max` and transparent require a GPT Image 2.5 model, so pair them with `--image-model gpt-image-2.5-sunburst` (or `-flare`). Treat them as *requests*: the Codex OAuth path has been observed normalising model/size/quality server-side, so the saved line prints the `model=` / `quality=` / `size=` the backend actually used — trust that, not the flag. If the user needs a guaranteed `quality=high` or a true transparent PNG, route them to the official `/v1/images/generations` API with their own `OPENAI_API_KEY`.
 - A single image typically takes **15–60 s**, but large or detailed ones occasionally run **2–3 min**. The default `--timeout` is 300 s to cover this; a genuine hang is caught sooner by the `--stall-timeout` idle window (default 120 s).
 - **Per-backend concurrency caps** (cross-process, flock slot pool; excess runs queue safely, waiters print "waiting…", and `--timeout` starts only once a slot is acquired): `web` = **1** (the page surface rate-limits aggressively — "Too many requests"; also one shared Chrome), `codex` = **4** (measured safe on Plus, capped so big fan-outs can't trip the account limiter). Override via `CHATGPT_IMAGEGEN_WEB_CONCURRENCY` / `CHATGPT_IMAGEGEN_CODEX_CONCURRENCY` (`0` = unlimited). Raising the `web` cap does not make `web` runs parallel: the cross-tool chatgpt.com lock below still runs them one at a time. For parallel batches use `--backend codex` + shell `&` + `wait`; firing parallel `web` runs is safe but executes one at a time. Do not loop blindly for "variants of the same prompt" — that just burns quota; iterate on the prompt instead.
 - **One chatgpt.com tab per machine.** `web` runs take a cross-TOOL advisory lock at `~/.chatgpt-web.lock` for the whole generation and drive a single stable chrome-use session named `chatgpt-web`, shared with [`chatgpt-use`](https://github.com/leeguooooo/chatgpt-use). This is not tidiness: ChatGPT pushes an "Image created" toast into *every* open chatgpt.com tab when *any* conversation on the account finishes an image, so a second tab can leak a sibling conversation's image into your run (issue #7), and two processes sharing one composer concatenate their prompts. The account also rate-limits on tab count alone. Anything else you write that automates chatgpt.com should take the same lock and session name.
@@ -317,7 +322,7 @@ It never touches stdout and is skipped under `--quiet`/`--no-progress`; `doctor`
 
 **codex backend (`run_codex`)**
 - Reads `~/.codex/auth.json` for `access_token`, `account_id`, `refresh_token`; reads `~/.codex/version.json` for the `version` header.
-- POSTs to `https://chatgpt.com/backend-api/codex/responses` with `tools: [{"type": "image_generation"}]`, streams the SSE response, base64-decodes the `image_generation_call` result.
+- POSTs to `https://chatgpt.com/backend-api/codex/responses` with `tools: [{"type": "image_generation"}]` (plus any of `model`/`quality`/`background`/`output_compression`/`action`/`partial_images` the user opted into — unset knobs are omitted), streams the SSE response, base64-decodes the `image_generation_call` result.
 - Auto-refreshes the OAuth token on 401/403 via `https://auth.openai.com/oauth/token` (`client_id=app_EMoamEEZ73f0CkXaXp7hrann`); the refreshed token is persisted back to `auth.json`.
 
 Why the web surface is reachable only through a real browser: the consumer `backend-api/*` paths are gated by three layers — Cloudflare's edge check, a sentinel proof-of-work (`sentinel/chat-requirements` + an in-page `sentinel/sdk.js` that computes the token), and a **Cloudflare Turnstile** token. Tested empirically: a bare bearer-token request from a residential IP **passes** the Cloudflare edge and the PoW (CF is IP-reputation-based; the PoW is hashcash-style and replicable offline) — the actual wall is **Turnstile**, an interactive token a headless client can't forge. And "borrow a browser only for the Turnstile token, then go headless" is self-defeating: the token is single-use and short-lived, so you'd open a browser every request anyway. That's why the web backend drives a genuine logged-in browser; the only true no-browser path is the `codex` backend (which bills Codex-usage).

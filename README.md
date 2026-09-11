@@ -65,7 +65,15 @@ chatgpt-imagegen "a different fictional person" --composition-ref photo.jpg     
 chatgpt-imagegen "a robot mascot" --style doodle                                    # apply a gallery style (auto-pulled + saved)
 chatgpt-imagegen animate "a dog happily wagging its tail" --style-online snoopy --also-gif
 OUT=$(chatgpt-imagegen "icon" --quiet)                                              # capture the path
+chatgpt-imagegen "product hero" --backend codex --image-model gpt-image-2.5-sunburst --quality xhigh
 ```
+
+The last line opts into the GPT Image 2.5 knobs — `--image-model`
+(`sunburst` for precise editing, `flare` for fast high quality), `--quality`
+(`low`→`max`), `--background transparent`, `--compression`, `--action`,
+`--partial-images`. They are **codex-only** (the web/gemini surfaces have no
+such controls), all optional, and are *requests* — the saved line prints the
+`model=`/`quality=`/`size=` the backend actually used.
 
 All three below came straight out of the commands above — no retouching:
 
@@ -143,7 +151,7 @@ This tool calls ChatGPT's internal `backend-api/codex` endpoint — the same one
 <details>
 <summary>Keywords</summary>
 
-`ChatGPT subscription image generation`, `free ChatGPT account image generation`, `use ChatGPT Plus for image API`, `gpt-image-2 without OPENAI_API_KEY`, `gpt-image-2 ChatGPT subscription`, `image_generation tool Responses API`, `ChatGPT image CLI`, `Codex CLI image_gen as standalone tool`, `DALL-E via ChatGPT Plus`, `OAuth-backed OpenAI image generation`, `no-API-key image generation`, `AI agent image generation skill`, `Claude Code image skill`, `OpenAI image generation without billing`.
+`ChatGPT subscription image generation`, `free ChatGPT account image generation`, `use ChatGPT Plus for image API`, `gpt-image-2.5 without OPENAI_API_KEY`, `gpt-image-2.5 ChatGPT subscription`, `gpt-image-2 ChatGPT subscription`, `image_generation tool Responses API`, `ChatGPT image CLI`, `Codex CLI image_gen as standalone tool`, `DALL-E via ChatGPT Plus`, `OAuth-backed OpenAI image generation`, `no-API-key image generation`, `AI agent image generation skill`, `Claude Code image skill`, `OpenAI image generation without billing`.
 
 **中文：** 用 ChatGPT 订阅生成图片、免费 ChatGPT 账号生图、ChatGPT Plus 生图工具、不用 API key 生图、gpt-image-2 用订阅、ChatGPT 订阅生图 CLI、Codex CLI 生图能力独立工具、给 AI agent 用的生图 skill、本地生图脚本、零依赖 Python 生图工具。
 </details>
