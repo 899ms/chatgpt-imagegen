@@ -67,13 +67,14 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-__version__ = "0.26.0"
+__version__ = "0.27.0"
 
 # What's-new, newest first — one terse line per release. The update reminder
 # surfaces these so a user learns WHAT changed, not just that a newer version
 # exists. Kept as flat, easy-to-regex comments near the top so the remote copy
 # can be parsed from the same 8KB prefix the reminder already reads — no extra
 # file to drift, no import needed. Format: `# WHATSNEW[<version>]: <summary>`.
+# WHATSNEW[0.27.0]: 上传改为独立子命令 `chatgpt-imagegen upload IMG --style SLUG`,**生成流程不再自动推送**(是否上传由用户看到结果后自己决定);输出补上该风格画廊页链接与今日剩余额度;machine id 默认用纯 hostname
 # WHATSNEW[0.26.0]: 新增匿名上传到 drawstyle 玩家画廊——`style upload IMG --style SLUG` 子命令,以及生成时的 `--upload [SLUG]` 旗标;复用 /api/uploads(免登录,≤5MB,10 次/机器/天),超限先 sips 压缩一次,输出返回直链与今日剩余额度
 # WHATSNEW[0.25.0]: codex 后端默认驱动模型换成 gpt-5.6-luna(fast & affordable,不再白烧前沿编码模型),不支持的模型自动回退 gpt-5.5;解析 response.created 的生效工具配置与 usage,保存行打印真实 model 与 token 用量,被服务端改写的参数给出告警(实测 codex 会把图片参数改写成 gpt-image-2-codex/auto)
 # WHATSNEW[0.24.0]: codex 后端补齐 GPT Image 2.5 的出图参数——新增 --image-model(sunburst/flare)、--quality(low…xhigh/max)、--background(transparent/opaque)、--compression、--action、--partial-images,全部可选、不设即沿用后端默认;成功行与请求行会打印真实的 model/quality/size,后端是否真的采纳一眼可查(订阅路径可能被服务端规范化)
@@ -4152,20 +4153,19 @@ def _read_publish_image(path: str, label: str) -> tuple[Path, str, bytes]:
 
 
 def _upload_machine_id() -> str:
-    """Stable per-machine id for the platform's daily upload quota.
+    """Per-machine id for the platform's daily upload quota.
 
-    The value IS the quota key, so it must not change between runs on a box.
-    Overridable (CHATGPT_IMAGEGEN_MACHINE_ID) when a fleet wants to pool or
-    split its 10/day budgets.
+    Defaults to the plain hostname (the platform's own convention); the value
+    IS the quota key, so keep it stable per box. CHATGPT_IMAGEGEN_MACHINE_ID
+    overrides it when a fleet wants to pool or split its 10/day budgets.
     """
     override = os.environ.get("CHATGPT_IMAGEGEN_MACHINE_ID", "").strip()
     if override:
         return override
     try:
-        host = socket.gethostname() or "unknown"
+        return socket.gethostname() or "unknown"
     except OSError:  # a hostname lookup must never break a run
-        host = "unknown"
-    return f"{host}-chatgpt-imagegen"
+        return "unknown"
 
 
 def _read_upload_image(path: str) -> tuple[Path, str, bytes]:
@@ -4245,26 +4245,17 @@ def _upload_gallery_image(img_path: str, style_slug: str | None) -> dict:
     return upload
 
 
-def _resolve_upload_slug(explicit: str | None, active: list[str],
-                         online: list[str] | None = None) -> str:
-    """Which style slug a bare `--upload` targets: the run's sole applied style.
-    Ambiguous (none / several) is an error, not a guess — the slug is public."""
-    slug = (explicit or "").strip()
-    if slug:
-        return slug
-    applied = list(active) + list(online or [])
-    if len(applied) == 1:
-        return applied[0]
-    raise SystemExit(
-        "error: --upload needs a style slug when the run applied no style or "
-        f"more than one (applied: {', '.join(applied) or 'none'}). "
-        "Use --upload <slug>.")
-
-
-def _format_upload_line(upload: dict) -> str:
+def _format_upload_line(upload: dict, style_slug: str | None = None) -> str:
+    """Human-readable upload result: direct image link, the style's gallery
+    page, and the remaining daily quota."""
+    lines = [f"uploaded → {upload['url']}"]
+    if style_slug:
+        lines.append(
+            f"gallery  → {_platform_base()}/en/s/{style_slug}/generations")
     remaining = upload.get("remaining_today")
-    tail = f"  (remaining today: {remaining})" if remaining is not None else ""
-    return f"uploaded → {upload['url']}{tail}"
+    if remaining is not None:
+        lines.append(f"remaining today: {remaining}")
+    return "\n".join(lines)
 
 
 def _download_bytes(url: str) -> bytes:
@@ -4851,6 +4842,29 @@ def _format_ref_provenance(kept_refs: list[dict]) -> list[str]:
     return lines
 
 
+def _upload_command(argv: list[str]) -> int:
+    """`chatgpt-imagegen upload <IMG> [--style SLUG]`.
+
+    The ONLY path that posts an image to the platform: uploading is the user's
+    call, made after they've seen the result — generation never auto-pushes.
+    """
+    p = argparse.ArgumentParser(
+        prog="chatgpt-imagegen upload",
+        description="Push one image to a drawstyle style's player gallery "
+                    f"(anonymous — no login; ≤{UPLOAD_MAX_BYTES // (1024 * 1024)} "
+                    f"MB/file, {UPLOAD_DAILY_LIMIT}/machine/day).",
+    )
+    p.add_argument("image", metavar="IMG")
+    p.add_argument("--style", dest="upload_style", default=None, metavar="SLUG",
+                   help="associate the upload with this style slug so it shows "
+                        "up in that style's player gallery")
+    a = p.parse_args(argv)
+    upload = _upload_gallery_image(a.image, a.upload_style)
+    print(_format_upload_line(upload, a.upload_style), file=sys.stderr)
+    print(upload["url"])          # stdout: the public URL, pipeable
+    return 0
+
+
 def _style_command(argv: list[str]) -> int:
     """`chatgpt-imagegen style <verb> ...` — manage style presets."""
     p = argparse.ArgumentParser(
@@ -4903,12 +4917,6 @@ def _style_command(argv: list[str]) -> int:
     sp.add_argument("--example", action="append", default=None, metavar="IMG")
     sp.add_argument("--from-last", action="store_true",
                     help="use the most recently generated image as an example")
-    sp = sub.add_parser("upload",
-                        help="push an image to a style's player gallery (no login)")
-    sp.add_argument("image", metavar="IMG")
-    sp.add_argument("--style", dest="upload_style", default=None, metavar="SLUG",
-                    help="associate the upload with this style slug so it shows "
-                         "up in that style's player gallery")
     a = p.parse_args(argv)
 
     if not a.verb:
@@ -4934,12 +4942,6 @@ def _style_command(argv: list[str]) -> int:
                   f"♥{style.get('likes_count', 0)} "
                   f"⇩{style.get('pulls_count', 0)} — {preview}")
             print(f"    chatgpt-imagegen style pull {style['slug']}")
-        return 0
-
-    if a.verb == "upload":
-        upload = _upload_gallery_image(a.image, a.upload_style)
-        print(_format_upload_line(upload), file=sys.stderr)
-        print(upload["url"])          # stdout: the public URL, pipeable
         return 0
 
     doc = _load_styles()
@@ -5450,6 +5452,8 @@ def _self_update() -> int:
 def main() -> int:
     if len(sys.argv) > 1 and sys.argv[1] in ("style", "styles"):
         return _style_command(sys.argv[2:])
+    if len(sys.argv) > 1 and sys.argv[1] == "upload":
+        return _upload_command(sys.argv[2:])
     if len(sys.argv) > 1 and sys.argv[1] == "doctor":
         return _doctor_command(sys.argv[2:])
     if len(sys.argv) > 1 and sys.argv[1] in ("update", "upgrade"):
@@ -5492,14 +5496,6 @@ def main() -> int:
              "only, without saving it to the local library (fetched on the fly). "
              "Repeatable; stacks with --style. Great for one-off use of a "
              "gallery style: `chatgpt-imagegen \"a cat\" --style-online xiaohei`.",
-    )
-    parser.add_argument(
-        "--upload", nargs="?", const="", default=None, metavar="SLUG",
-        help="After generating, push the image to the drawstyle player gallery "
-             "(anonymous, no login). Bare --upload associates it with the style "
-             "applied to this run; pass a slug to name one explicitly. The public "
-             f"URL is printed to stderr. Cap {UPLOAD_MAX_BYTES // (1024 * 1024)} "
-             f"MB/file, {UPLOAD_DAILY_LIMIT}/machine/day.",
     )
     parser.add_argument(
         "-o", "--out",
@@ -5923,16 +5919,6 @@ def main() -> int:
     # Record this image so `style add --from-last` / `add-ref --from-last` can
     # pin it. The `style` subcommand returns early above, so it never records.
     _record_last_output(out_path)
-
-    # Optional: publish the result to the platform's player gallery. Kept out of
-    # stdout (which stays exactly the saved path) — the URL goes to stderr.
-    if getattr(args, "upload", None) is not None:
-        _upload_slug = _resolve_upload_slug(
-            args.upload, _active, args.style_online or [])
-        _uploaded = _upload_gallery_image(str(out_path), _upload_slug)
-        print(_fmt_progress(time.monotonic() - start,
-                            _green(_format_upload_line(_uploaded))),
-              file=sys.stderr)
 
     if progress:
         size_info = f"  size={meta.get('size')}" if meta.get("size") else ""

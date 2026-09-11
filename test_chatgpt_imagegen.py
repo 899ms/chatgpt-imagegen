@@ -1892,13 +1892,12 @@ class StylePublish(unittest.TestCase):
 
 
 class GalleryUpload(unittest.TestCase):
-    """Anonymous POST /api/uploads — `style upload` and `--upload`."""
+    """Anonymous POST /api/uploads — the standalone `upload` subcommand."""
 
     def test_machine_id_default_and_override(self):
         with unittest.mock.patch.object(cig.socket, "gethostname",
                                         return_value="box.local"):
-            self.assertEqual(cig._upload_machine_id(),
-                             "box.local-chatgpt-imagegen")
+            self.assertEqual(cig._upload_machine_id(), "box.local")
         with unittest.mock.patch.dict(
                 os.environ, {"CHATGPT_IMAGEGEN_MACHINE_ID": "fleet-7"}):
             self.assertEqual(cig._upload_machine_id(), "fleet-7")
@@ -1976,17 +1975,7 @@ class GalleryUpload(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     cig._upload_gallery_image(img, None)
 
-    def test_resolve_slug_explicit_single_ambiguous(self):
-        self.assertEqual(cig._resolve_upload_slug("s", [], []), "s")
-        self.assertEqual(cig._resolve_upload_slug("", ["only"], []), "only")
-        self.assertEqual(cig._resolve_upload_slug("", [], ["online-1"]),
-                         "online-1")
-        with self.assertRaises(SystemExit):
-            cig._resolve_upload_slug("", [], [])
-        with self.assertRaises(SystemExit):
-            cig._resolve_upload_slug("", ["a", "b"], [])
-
-    def test_style_upload_subcommand(self):
+    def test_upload_command(self):
         with tempfile.TemporaryDirectory() as d:
             img = _write_png(os.path.join(d, "o.png"))
             err = io.StringIO()
@@ -1995,10 +1984,11 @@ class GalleryUpload(unittest.TestCase):
                     return_value={"upload": {"url": "https://x/img/y.png",
                                              "remaining_today": 6}}), \
                  redirect_stderr(err):
-                rc = cig._style_command(["upload", img, "--style", "foo"])
+                rc = cig._upload_command([img, "--style", "foo"])
             self.assertEqual(rc, 0)
             self.assertIn("remaining today: 6", err.getvalue())
             self.assertIn("https://x/img/y.png", err.getvalue())
+            self.assertIn("/en/s/foo/generations", err.getvalue())
 
 
 class PlatformAccessTokenRefreshFallback(unittest.TestCase):
