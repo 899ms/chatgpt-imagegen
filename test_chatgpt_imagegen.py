@@ -1123,6 +1123,74 @@ class PromptWordingByKind(unittest.TestCase):
         self.assertEqual(payload["tool_choice"], "required")
 
 
+class CodexModelFallback(unittest.TestCase):
+    def test_default_is_a_fast_cheap_driver(self):
+        self.assertEqual(cig.CODEX_MODEL_DEFAULT, "gpt-5.6-luna")
+
+    def test_detects_account_allowlist_rejection(self):
+        e = cig.GatewayError(
+            "HTTP 400: {\"detail\":\"The 'gpt-5-nano' model is not supported "
+            "when using Codex with a ChatGPT account.\"}", status=400)
+        self.assertTrue(cig._model_unsupported_error(e))
+        self.assertFalse(cig._model_unsupported_error(
+            cig.GatewayError("HTTP 400: invalid payload", status=400)))
+        self.assertFalse(cig._model_unsupported_error(
+            cig.GatewayError("HTTP 500: boom", status=500)))
+
+
+class CodexToolOverrideWarning(unittest.TestCase):
+    """Codex rewrites the image tool server-side; a dropped knob must be named."""
+
+    def _capture(self, args, effective):
+        err = io.StringIO()
+        with redirect_stderr(err):
+            cig._warn_codex_tool_overrides(args, effective)
+        return err.getvalue()
+
+    def test_warns_on_rewritten_knobs(self):
+        ns = argparse.Namespace(image_model="gpt-image-2.5-sunburst",
+                                quality="xhigh", background=None, compression=None)
+        out = self._capture(ns, {"model": "gpt-image-2-codex", "quality": "auto"})
+        self.assertIn("model=gpt-image-2.5-sunburst→gpt-image-2-codex", out)
+        self.assertIn("quality=xhigh→auto", out)
+
+    def test_silent_when_nothing_requested(self):
+        ns = argparse.Namespace(image_model=None, quality=None,
+                                background=None, compression=None)
+        self.assertEqual(self._capture(ns, {"model": "gpt-image-2-codex"}), "")
+
+    def test_silent_when_value_survived(self):
+        ns = argparse.Namespace(image_model="gpt-image-2-codex", quality=None,
+                                background=None, compression=None)
+        self.assertEqual(self._capture(ns, {"model": "gpt-image-2-codex"}), "")
+
+
+class CodexEffectiveConfigCapture(unittest.TestCase):
+    """`_post_for_image` keeps the server's effective tool config and usage."""
+
+    def test_captures_effective_tool_and_usage(self):
+        blob = cig.base64.b64encode(b"image-bytes").decode()
+        events = [
+            {"type": "response.created", "response": {"tools": [
+                {"type": "image_generation", "model": "gpt-image-2-codex",
+                 "quality": "auto"}]}},
+            {"type": "response.output_item.done", "item": {
+                "type": "image_generation_call", "result": blob,
+                "size": "1024x1024", "quality": "low"}},
+            {"type": "response.completed", "response": {"usage": {
+                "input_tokens": 2316, "output_tokens": 41,
+                "total_tokens": 2357}}},
+        ]
+        now = time.monotonic()
+        with unittest.mock.patch.object(cig, "_stream",
+                                        lambda *a, **k: iter(events)):
+            data, meta = cig._post_for_image({}, {}, now + 60, now, 60.0, False)
+        self.assertEqual(data, b"image-bytes")
+        self.assertEqual(meta["effective_tool"]["model"], "gpt-image-2-codex")
+        self.assertEqual(meta["usage"]["total_tokens"], 2357)
+        self.assertEqual(meta["size"], "1024x1024")
+
+
 class CodexImageToolOptions(unittest.TestCase):
     """The GPT Image 2.5 knobs live inside the image_generation tool, and unset
     ones are omitted so payloads from existing callers stay byte-identical."""

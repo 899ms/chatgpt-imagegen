@@ -73,7 +73,12 @@ The last line opts into the GPT Image 2.5 knobs — `--image-model`
 (`low`→`max`), `--background transparent`, `--compression`, `--action`,
 `--partial-images`. They are **codex-only** (the web/gemini surfaces have no
 such controls), all optional, and are *requests* — the saved line prints the
-`model=`/`quality=`/`size=` the backend actually used.
+`model=`/`quality=`/`size=` the backend actually used. Note: the **codex**
+backend rewrites these server-side (observed `gpt-image-2-codex` / `auto`), so
+they rarely survive there; what does matter on codex is `--model`, the *driver*
+model that calls the tool (default `gpt-5.6-luna`, a fast/affordable Codex model
+— a frontier coding model just burns the metered Codex bucket). Every run prints
+the `tokens=` it cost.
 
 All three below came straight out of the commands above — no retouching:
 

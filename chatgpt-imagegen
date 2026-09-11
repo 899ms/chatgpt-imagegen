@@ -66,13 +66,14 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-__version__ = "0.24.0"
+__version__ = "0.25.0"
 
 # What's-new, newest first — one terse line per release. The update reminder
 # surfaces these so a user learns WHAT changed, not just that a newer version
 # exists. Kept as flat, easy-to-regex comments near the top so the remote copy
 # can be parsed from the same 8KB prefix the reminder already reads — no extra
 # file to drift, no import needed. Format: `# WHATSNEW[<version>]: <summary>`.
+# WHATSNEW[0.25.0]: codex 后端默认驱动模型换成 gpt-5.6-luna(fast & affordable,不再白烧前沿编码模型),不支持的模型自动回退 gpt-5.5;解析 response.created 的生效工具配置与 usage,保存行打印真实 model 与 token 用量,被服务端改写的参数给出告警(实测 codex 会把图片参数改写成 gpt-image-2-codex/auto)
 # WHATSNEW[0.24.0]: codex 后端补齐 GPT Image 2.5 的出图参数——新增 --image-model(sunburst/flare)、--quality(low…xhigh/max)、--background(transparent/opaque)、--compression、--action、--partial-images,全部可选、不设即沿用后端默认;成功行与请求行会打印真实的 model/quality/size,后端是否真的采纳一眼可查(订阅路径可能被服务端规范化)
 # WHATSNEW[0.23.7]: chatgpt.com 改为全机器单窗口——与 chatgpt-use 共用 ~/.chatgpt-web.lock 把整轮生成串起来,并共用 chrome-use 会话名 chatgpt-web,避免多开标签页触发限流、互相串图;排队时说明在等哪个工具(#33)
 # WHATSNEW[0.23.6]: Windows 认证持久化与路径测试可跨平台运行(#32);main 上版本变化且 CI 通过后自动创建 GitHub Release;交互式运行每天检查到新版时自动升级,失败则保留手动升级提示
@@ -773,7 +774,8 @@ def _build_payload(
         tool_choice = "auto"
 
     # The Codex backend requires `instructions` to match an allowlisted prompt.
-    # We use a tiny system-style instruction known to be accepted on gpt-5.5.
+    # We use a tiny system-style instruction known to be accepted on the Codex
+    # account models (verified on gpt-5.5 and gpt-5.6-luna).
     return {
         "model": model,
         "stream": True,
@@ -893,6 +895,8 @@ def _post_for_image(
     saw_event_types: dict[str, int] = {}
     image_b64: str | None = None
     item_meta: JsonDict = {}
+    effective_tool: JsonDict = {}
+    usage: JsonDict = {}
     last_revised_prompt: str = ""
     last_phase = "connecting"
     failure_detail: str | None = None
@@ -932,6 +936,19 @@ def _post_for_image(
                     detail = evt["error"].get("message") or detail
                 if detail:
                     failure_detail = str(detail)
+            if t in ("response.created", "response.completed"):
+                # The server publishes the EFFECTIVE tool config here — and on the
+                # codex path it rewrites ours (observed: model→gpt-image-2-codex,
+                # quality/size/background→auto). Capturing it lets the CLI report
+                # what actually ran and warn when a requested knob was overridden.
+                resp = evt.get("response")
+                if isinstance(resp, dict):
+                    for tool in (resp.get("tools") or []):
+                        if (isinstance(tool, dict)
+                                and tool.get("type") == "image_generation"):
+                            effective_tool = tool
+                    if isinstance(resp.get("usage"), dict):
+                        usage = resp["usage"]
             if t == "response.output_item.done":
                 item = evt.get("item")
                 if isinstance(item, dict) and item.get("type") == "image_generation_call":
@@ -980,6 +997,10 @@ def _post_for_image(
         image_bytes = base64.b64decode(image_b64, validate=True)
     except Exception:
         raise GatewayError("backend returned invalid base64 in image_generation_call.result") from None
+    if effective_tool:
+        item_meta["effective_tool"] = effective_tool
+    if usage:
+        item_meta["usage"] = usage
     return image_bytes, item_meta
 
 
@@ -1649,6 +1670,17 @@ def _backend_limit(kind: str, default: int) -> int:
 #           fanning out a big batch can't trip the per-account limiter.
 WEB_CONCURRENCY_DEFAULT = 1
 CODEX_CONCURRENCY_DEFAULT = 4
+
+# The codex/responses image path needs a *driver* model that reads the prompt and
+# calls the `image_generation` tool — the picture itself is rendered by the
+# server's own image model (observed: `gpt-image-2-codex`), and the tool config
+# we send is rewritten server-side. So a frontier "coding" model is pure waste
+# here: it bills the metered Codex bucket and buys no better image. Default to a
+# Codex-account model advertised as "fast and affordable"; override with
+# `--model` / CHATGPT_IMAGEGEN_MODEL. The account has its own model allowlist
+# (GET /backend-api/codex/models), so an unsupported model falls back cleanly.
+CODEX_MODEL_DEFAULT = "gpt-5.6-luna"
+CODEX_MODEL_FALLBACK = "gpt-5.5"
 
 
 # Whether this platform gives us a cross-process file lock at all. Both
@@ -3124,6 +3156,29 @@ _CODEX_IMAGE_OPTION_FLAGS = (
 )
 
 
+def _warn_codex_tool_overrides(args: argparse.Namespace, effective: dict) -> None:
+    """The codex path rewrites the image tool server-side (observed: model →
+    gpt-image-2-codex, quality/size/background → auto). When a requested knob
+    did not survive, say so — silently ignoring it is what makes the flag look
+    broken. Not gated on `progress`: this must survive --no-progress."""
+    if not effective:
+        return
+    asked = {
+        "model": getattr(args, "image_model", None),
+        "quality": getattr(args, "quality", None),
+        "background": getattr(args, "background", None),
+        "output_compression": getattr(args, "compression", None),
+    }
+    changed = [f"{k}={v}→{effective.get(k)}" for k, v in asked.items()
+               if v is not None and str(effective.get(k)).lower() != str(v).lower()]
+    if changed:
+        print(_fmt_progress(
+            0.0,
+            "warning: codex rewrote the image tool server-side "
+            f"({', '.join(changed)}); the server decides these on this path."),
+            file=sys.stderr)
+
+
 def _codex_only_options(args: argparse.Namespace) -> list[str]:
     """Flags the user set that the image tool can only honour on the codex
     backend — web/gemini/agy have no such knobs."""
@@ -3390,6 +3445,12 @@ def _render_animation(sprite_path: Path, sprite_bytes: bytes, out_path: Path,
 
 # ---------- codex backend (headless responses API) ----------
 
+def _model_unsupported_error(err: GatewayError) -> bool:
+    """True for the Codex account-allowlist rejection (HTTP 400 naming the model
+    and the ChatGPT account), as opposed to a generic bad request."""
+    return err.status == 400 and "not supported when using Codex" in str(err)
+
+
 def run_codex(
     args: argparse.Namespace, progress: bool, stall_timeout: float, start: float,
     refs: list[str] | None = None,
@@ -3465,6 +3526,18 @@ def _run_codex_locked(
     try:
         return _attempt(access)
     except GatewayError as e:
+        # A Codex-account allowlist rejects unknown models with HTTP 400. The
+        # default comes from that allowlist, but a user-supplied --model (or a
+        # future rotation) can miss — fall back once instead of failing the run.
+        if (_model_unsupported_error(e)
+                and payload.get("model") != CODEX_MODEL_FALLBACK):
+            if progress:
+                print(f"[{time.monotonic() - start:6.1f}s] model "
+                      f"{payload.get('model')!r} not supported by this Codex "
+                      f"account; retrying with {CODEX_MODEL_FALLBACK}",
+                      file=sys.stderr)
+            payload["model"] = CODEX_MODEL_FALLBACK
+            return _attempt(access)
         # Auto-refresh on 401/403 once, then retry. Any other error → fail clean.
         if e.status in (401, 403) and refresh:
             if progress:
@@ -5330,7 +5403,14 @@ def main() -> int:
         parser.set_defaults(format="png")
     else:
         parser.add_argument("--format", default="png", choices=["png", "jpeg", "webp"])
-    parser.add_argument("--model", default=os.environ.get("CHATGPT_IMAGEGEN_MODEL", "gpt-5.5"))
+    parser.add_argument("--model", default=os.environ.get("CHATGPT_IMAGEGEN_MODEL", CODEX_MODEL_DEFAULT),
+                        help="(codex backend) the DRIVER model that calls the "
+                             "image tool — NOT the image model (the server "
+                             "renders with its own, e.g. gpt-image-2-codex). "
+                             "Pick a Codex-account model; the fast/affordable "
+                             f"ones cost the metered Codex bucket less (default: "
+                             f"{CODEX_MODEL_DEFAULT}). Also settable via "
+                             "CHATGPT_IMAGEGEN_MODEL.")
     # GPT Image 2.5 tool knobs. All codex-only (the web/gemini surfaces expose
     # no such controls), all optional: unset means "keep the backend default".
     parser.add_argument(
@@ -5657,6 +5737,7 @@ def main() -> int:
                 print(_dim(f"             • {_line}"), file=sys.stderr)
 
     image_bytes, meta = _dispatch(args, progress, stall_timeout, start)
+    _warn_codex_tool_overrides(args, meta.get("effective_tool") or {})
 
     if animate_mode:
         out_path = animation_out_path
@@ -5703,16 +5784,25 @@ def main() -> int:
     if progress:
         size_info = f"  size={meta.get('size')}" if meta.get("size") else ""
         quality_info = f"  quality={meta.get('quality')}" if meta.get("quality") else ""
-        # The image model is only reported by the codex tool metadata; printing
-        # it lets a caller verify the backend honoured --image-model (the Codex
-        # OAuth path has been observed normalising model/size/quality).
-        model_info = f"  model={meta.get('model')}" if meta.get("model") else ""
+        # The image model lives in the image_generation_call item when the tool
+        # reports it, else in the server's effective tool config (captured from
+        # response.created) — which is also where a codex rewrite shows up.
+        _eff = meta.get("effective_tool") or {}
+        _model = meta.get("model") or _eff.get("model")
+        model_info = f"  model={_model}" if _model else ""
+        # Codex reports token usage; surface it so the metered cost is visible.
+        _usage = meta.get("usage") or {}
+        tokens_info = ""
+        if _usage.get("total_tokens") is not None:
+            tokens_info = (f"  tokens={_usage.get('total_tokens')}"
+                           f" (in {_usage.get('input_tokens', '?')}"
+                           f" / out {_usage.get('output_tokens', '?')})")
         print(
             _fmt_progress(
                 time.monotonic() - start,
                 _green(f"✓ saved → {out_path}")
                 + _dim(f"  ({len(image_bytes):,} bytes)"
-                       f"{size_info}{quality_info}{model_info}"),
+                       f"{size_info}{quality_info}{model_info}{tokens_info}"),
             ),
             file=sys.stderr,
         )
