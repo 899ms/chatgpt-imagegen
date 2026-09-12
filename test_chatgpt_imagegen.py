@@ -2100,6 +2100,12 @@ class ApplyPackageMalformed(unittest.TestCase):
         self.assertIn("malformed package response", str(cm.exception))
 
 
+def _composer_state(text="", attachments=0, ready=None, **kw):
+    return {"exists": True, "text": text, "attachments": attachments,
+            "ready": attachments if ready is None else ready, "busy": False,
+            "send_ready": True, "user_turns": 0, **kw}
+
+
 class UploadReferences(unittest.TestCase):
     """The composer's file input moved (issue #19) — the selector cascade is what
     keeps img2img working across that reshuffle, so pin its behaviour."""
@@ -2111,14 +2117,17 @@ class UploadReferences(unittest.TestCase):
         Returns (selectors tried, emitted lines) or raises whatever it raises.
         """
         tried, emitted = [], []
+        uploaded = False
 
         def fake_ab(ab, *args, session=None, timeout=None, profile=None):
+            nonlocal uploaded
             if args[0] == "upload":
                 tried.append(args[1])
                 if args[1] in fail_selectors:
-                    raise cig.GatewayError(f"chrome-use upload failed: {args[1]}")
+                    raise cig.GatewayError(f"element not found: {args[1]}")
+                uploaded = True
                 return ""
-            return json.dumps(json.dumps(1))  # _JS_PENDING_UPLOADS → 1 thumbnail
+            return json.dumps(json.dumps(_composer_state(attachments=int(uploaded))))
 
         with unittest.mock.patch.object(cig, "_ab", fake_ab), \
                 unittest.mock.patch.object(cig.time, "sleep", lambda *_: None):
@@ -2129,7 +2138,7 @@ class UploadReferences(unittest.TestCase):
     def test_uses_current_composer_input_first(self):
         tried, emitted = self._run(fail_selectors=())
         self.assertEqual(tried, ["#upload-files"])
-        self.assertIn("reference attached", emitted)
+        self.assertIn("all 1 reference image(s) uploaded", emitted)
 
     def test_falls_back_to_next_selector(self):
         tried, _ = self._run(fail_selectors=("#upload-files",))
@@ -2143,6 +2152,159 @@ class UploadReferences(unittest.TestCase):
     def test_legacy_selector_is_still_last_resort(self):
         # Old DOMs exposed only input[accept="image/*"]; keep them working.
         self.assertIn('input[accept="image/*"]', cig._UPLOAD_SELECTORS)
+
+    def test_waits_for_all_five_server_backed_images(self):
+        states = [_composer_state(), _composer_state(attachments=1, ready=0),
+                  _composer_state(attachments=5, ready=1),
+                  _composer_state(attachments=5, ready=4),
+                  _composer_state(attachments=5, busy=True), _composer_state(attachments=5)]
+        with unittest.mock.patch.object(cig, "_web_composer_state", side_effect=states), \
+             unittest.mock.patch.object(cig, "_ab") as ab, \
+             unittest.mock.patch.object(cig.time, "sleep"):
+            refs = [f"/ref{i}.png" for i in range(5)]
+            cig._upload_references("ab", "s", refs, lambda: 90, lambda _: None)
+        ab.assert_called_once_with("ab", "upload", "#upload-files", *refs,
+                                   session="s", timeout=90.0)
+
+    def test_partial_or_unconfirmed_upload_never_proceeds(self):
+        for state in (_composer_state(), _composer_state(attachments=1),
+                      _composer_state(attachments=5, ready=4)):
+            with self.subTest(state=state), \
+                 unittest.mock.patch.object(cig, "_web_composer_state",
+                     side_effect=[_composer_state()] + [state] * 90), \
+                 unittest.mock.patch.object(cig, "_ab") as ab, \
+                 unittest.mock.patch.object(cig.time, "sleep"):
+                with self.assertRaisesRegex(cig.GatewayError, "upload incomplete.*not submitted"):
+                    cig._upload_references("ab", "s", ["/ref.png"] * 5,
+                                           lambda: 90, lambda _: None)
+                ab.assert_called_once()
+
+    def test_upload_error_after_dispatch_does_not_duplicate_images(self):
+        with unittest.mock.patch.object(cig, "_web_composer_state", side_effect=[
+                 _composer_state(), _composer_state(attachments=2), _composer_state(attachments=5)]), \
+             unittest.mock.patch.object(cig, "_ab", side_effect=cig.GatewayError("timed out")) as ab:
+            cig._upload_references("ab", "s", ["/ref.png"] * 5, lambda: 90, lambda _: None)
+        ab.assert_called_once()
+
+    def test_uncertain_upload_with_no_thumbnails_is_not_replayed(self):
+        with unittest.mock.patch.object(cig, "_web_composer_state", return_value=_composer_state()), \
+             unittest.mock.patch.object(cig, "_ab", side_effect=cig.GatewayError("timed out")) as ab:
+            with self.assertRaisesRegex(cig.GatewayError, "outcome is uncertain"):
+                cig._upload_references("ab", "s", ["/ref.png"], lambda: 90, lambda _: None)
+        ab.assert_called_once()
+
+    def test_preexisting_and_duplicate_attachments_are_rejected(self):
+        for states in ([_composer_state(attachments=1)],
+                       [_composer_state(), _composer_state(attachments=6)]):
+            with self.subTest(states=states), \
+                 unittest.mock.patch.object(cig, "_web_composer_state", side_effect=states), \
+                 unittest.mock.patch.object(cig, "_ab") as ab:
+                with self.assertRaises(cig.GatewayError):
+                    cig._upload_references("ab", "s", ["/ref.png"] * 5, lambda: 90, lambda _: None)
+                self.assertLessEqual(ab.call_count, 1)
+
+    def test_existing_draft_stops_before_upload(self):
+        with unittest.mock.patch.object(cig, "_web_composer_state",
+                 return_value=_composer_state("existing draft")), \
+             unittest.mock.patch.object(cig, "_ab") as ab:
+            with self.assertRaisesRegex(cig.GatewayError, "references not uploaded"):
+                cig._upload_references("ab", "s", ["/ref.png"], lambda: 90, lambda _: None)
+        ab.assert_not_called()
+
+
+class WebPromptSubmission(unittest.TestCase):
+    def _run(self, states, prompt="first\n\n猫 🦊\nlast\n", send_error=False):
+        self.calls = []
+
+        def ab(*args, **kw):
+            self.calls.append((args, kw))
+            if send_error and args[1] == "click":
+                raise cig.GatewayError("click outcome unknown")
+
+        state_iter = iter(states)
+        with unittest.mock.patch.object(cig, "_web_composer_state",
+                 side_effect=lambda *a: next(state_iter, states[-1])), \
+             unittest.mock.patch.object(cig, "_ab", side_effect=ab), \
+             unittest.mock.patch.object(cig.time, "sleep"):
+            cig._submit_web_prompt("ab", "s", prompt, 5, lambda: 90, lambda _: None)
+
+    def test_long_multiline_prompt_uses_stdin_and_one_click(self):
+        prompt = (" \tParagraph — 猫, 'quotes', $(), `code`.\n\n" * 4000) + "end\n"
+        self._run([_composer_state(attachments=5),
+                   _composer_state(prompt, attachments=5, send_ready=False),
+                   _composer_state(prompt, attachments=5),
+                   _composer_state(user_turns=1)], prompt)
+        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(self.calls[0][0], ("ab", "fill", "#prompt-textarea", "--stdin"))
+        self.assertEqual(self.calls[0][1]["input_text"], prompt)
+        self.assertEqual(self.calls[1][0][1:], ("click", 'button[data-testid="send-button"]'))
+
+    def test_changed_text_attachments_or_early_submission_prevents_send(self):
+        prompt = "first\n\n猫 🦊\nlast\n"
+        bad = [_composer_state(prompt.replace("\n", ""), attachments=5),
+               _composer_state(prompt, attachments=4),
+               _composer_state(prompt, attachments=5, ready=4),
+               _composer_state(prompt, attachments=5, user_turns=1)]
+        for state in bad:
+            with self.subTest(state=state), self.assertRaises(cig.GatewayError):
+                self._run([_composer_state(attachments=5), state], prompt)
+            self.assertEqual([a[1] for a, _ in self.calls], ["fill"])
+
+    def test_existing_draft_is_not_overwritten(self):
+        with self.assertRaisesRegex(cig.GatewayError, "not empty"):
+            self._run([_composer_state("existing draft", attachments=5)])
+        self.assertEqual(self.calls, [])
+
+    def test_disabled_send_button_never_gets_clicked(self):
+        prompt = "first\n\n猫 🦊\nlast\n"
+        with self.assertRaisesRegex(cig.GatewayError, "did not become ready"):
+            self._run([_composer_state(attachments=5),
+                       _composer_state(prompt, attachments=5, send_ready=False)])
+        self.assertEqual(len(self.calls), 1)
+
+    def test_ambiguous_send_is_checked_without_replaying(self):
+        prompt = "first\n\n猫 🦊\nlast\n"
+        self._run([_composer_state(attachments=5),
+                   _composer_state(prompt, attachments=5),
+                   _composer_state(prompt, attachments=5),
+                   _composer_state(user_turns=1)], send_error=True)
+        self.assertEqual(len(self.calls), 2)
+
+    def test_empty_composer_alone_is_not_proof_of_submission(self):
+        prompt = "first\n\n猫 🦊\nlast\n"
+        with self.assertRaisesRegex(cig.GatewayError, "Send was not repeated"):
+            self._run([_composer_state(attachments=5),
+                       _composer_state(prompt, attachments=5), _composer_state()])
+        self.assertEqual(len(self.calls), 2)
+
+    def test_multiple_user_turns_are_reported_without_another_send(self):
+        prompt = "first\n\n猫 🦊\nlast\n"
+        with self.assertRaisesRegex(cig.GatewayError, "multiple ChatGPT user messages"):
+            self._run([_composer_state(attachments=5),
+                       _composer_state(prompt, attachments=5), _composer_state(user_turns=2)])
+        self.assertEqual(len(self.calls), 2)
+
+    def test_ab_passes_prompt_on_stdin_without_adding_it_to_argv(self):
+        prompt = "long\n\n猫\n"
+        result = argparse.Namespace(returncode=0, stdout="done")
+        with unittest.mock.patch.object(cig.subprocess, "run", return_value=result) as run:
+            cig._ab("ab", "fill", "#prompt-textarea", "--stdin", input_text=prompt,
+                    session="s", timeout=60)
+        self.assertEqual(run.call_args.kwargs["input"], prompt)
+        self.assertNotIn(prompt, run.call_args.args[0])
+
+    def test_failed_upload_cleans_downloads_and_never_types(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "download.png"
+            path.write_bytes(b"test")
+            with unittest.mock.patch.object(cig, "_resolve_ref_path", return_value=(str(path), str(path))), \
+                 unittest.mock.patch.object(cig, "_upload_references", side_effect=cig.GatewayError("incomplete")), \
+                 unittest.mock.patch.object(cig, "_submit_web_prompt") as submit:
+                with self.assertRaises(cig.GatewayError):
+                    cig._generate_in_browser("ab", "s", "prompt", argparse.Namespace(),
+                        time.monotonic() + 90, lambda: 90, lambda _: None, refs=["https://x/ref.png"])
+            self.assertFalse(path.exists())
+            submit.assert_not_called()
 
 
 class SslContext(unittest.TestCase):

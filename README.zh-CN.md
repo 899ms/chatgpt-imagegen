@@ -94,6 +94,10 @@ chatgpt-imagegen "产品主图" --backend codex --image-model gpt-image-2.5-sunb
 
 完整参数:`chatgpt-imagegen --help`。→ **[生成图片](https://drawstyle.leeguoo.com/zh/docs/generate)** · **[风格系统](https://drawstyle.leeguoo.com/zh/docs/styles)**
 
+ChatGPT 浏览器后端会粘贴多行提示词,核对编辑器中的完整文本,等待所有参考图上传
+完成后只点击一次发送。上传不完整或文本发生变化时会停止;无法确认发送结果时会
+报告问题,不会重复发送。运行前请确保输入框为空,已有草稿会被保留。
+
 ## 社区风格
 
 浏览、复用别人调好的画风——公共画廊在 **[drawstyle.leeguoo.com](https://drawstyle.leeguoo.com)**,不用更新脚本:

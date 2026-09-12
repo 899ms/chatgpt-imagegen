@@ -1278,12 +1278,14 @@ def _web_unavailable_message(
     return "\n".join(lines)
 
 
-def _ab(ab: str, *ab_args: str, session: str, timeout: float, profile: str | None = None) -> str:
+def _ab(ab: str, *ab_args: str, session: str, timeout: float, profile: str | None = None,
+        input_text: str | None = None) -> str:
     """Run one chrome-use subcommand, return stdout. Raises GatewayError on failure.
 
     ``profile`` (a Chrome profile name/path) is passed as chrome-use's global
     ``--profile`` flag, which must precede the subcommand. Only the launching
     ``open`` call needs it; later calls reuse the session's browser.
+    Large or multiline text can be passed via stdin without shell/argv limits.
     """
     cmd = [ab]
     if profile:
@@ -1291,7 +1293,8 @@ def _ab(ab: str, *ab_args: str, session: str, timeout: float, profile: str | Non
     cmd += [*ab_args, "--session", session]
     try:
         proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=max(5.0, timeout)
+            cmd, capture_output=True, text=True, timeout=max(5.0, timeout),
+            **({"input": input_text} if input_text is not None else {})
         )
     except subprocess.TimeoutExpired:
         raise GatewayError(f"chrome-use timed out: {' '.join(ab_args[:2])}") from None
@@ -2089,14 +2092,72 @@ def _resolve_ref_path(ref: str) -> tuple[str, str | None]:
     return str(p), None
 
 
-# JS: count reference attachments sitting in the composer (uploaded, not yet
-# sent). Used to confirm an upload landed before we submit the edit prompt.
-_JS_PENDING_UPLOADS = r"""(() => {
-  const form = document.querySelector('form') || document.body;
-  const imgs = [...form.querySelectorAll('img')]
-    .filter(i => /blob:|estuary\/content|oaiusercontent/.test(i.src || ''));
-  return JSON.stringify(imgs.length);
+# Read the editor's logical text, not innerText (which adds visual paragraph
+# spacing) or textContent (which loses paragraph breaks). A ProseMirror trailing
+# BR is an empty-paragraph placeholder, not an extra newline.
+_JS_WEB_COMPOSER_STATE = r"""(() => {
+  const composer = document.querySelector('#prompt-textarea');
+  const form = composer && composer.closest('form');
+  const read = n => {
+    if (n.nodeType === 3) return n.textContent;
+    if (n.nodeName === 'BR')
+      return n.classList.contains('ProseMirror-trailingBreak') ? '' : '\n';
+    return [...n.childNodes].map(read).join('');
+  };
+  let text = null;
+  if (composer) {
+    const nodes = [...composer.childNodes];
+    text = 'value' in composer ? composer.value :
+      nodes.some(n => /^(P|DIV)$/.test(n.nodeName))
+        ? nodes.map(read).join('\n') : read(composer);
+  }
+  const images = form ? [...form.querySelectorAll('img')]
+    .filter(i => /blob:|estuary\/content|oaiusercontent/.test(i.src || '')) : [];
+  const send = form && form.querySelector('button[data-testid="send-button"]');
+  return JSON.stringify({
+    exists: !!composer, text,
+    attachments: images.length,
+    // Blob thumbnails appear before the upload finishes. Only server-backed
+    // images count as ready; don't send with a partially uploaded batch.
+    ready: images.filter(i => !i.src.startsWith('blob:')).length,
+    busy: !!(form && form.querySelector('[role="progressbar"], [aria-busy="true"]')),
+    send_ready: !!send && !send.disabled && send.getAttribute('aria-disabled') !== 'true',
+    user_turns: document.querySelectorAll('[data-message-author-role="user"]').length,
+  });
 })()"""
+
+
+def _web_composer_state(ab, session, remaining) -> dict:
+    state = _ab_eval(ab, _JS_WEB_COMPOSER_STATE, session=session,
+                     timeout=min(15.0, remaining()))
+    if not isinstance(state, dict) or not state.get("exists"):
+        raise GatewayError("ChatGPT composer is unavailable; submission cannot be verified")
+    return state
+
+
+def _wait_web_uploads(ab, session, expected, remaining, emit) -> None:
+    deadline = time.monotonic() + min(90.0, remaining())
+    state = {}
+    last_counts = None
+    for _ in range(90):
+        state = _web_composer_state(ab, session, remaining)
+        counts = (state.get("ready", 0), state.get("attachments", 0))
+        if counts[1] > expected:
+            raise GatewayError(f"ChatGPT has {counts[1]} attachments, expected {expected}; "
+                               "prompt not submitted (possible duplicate upload)")
+        if counts == (expected, expected) and not state.get("busy"):
+            emit(f"all {expected} reference image(s) uploaded")
+            return
+        if counts != last_counts:
+            emit(f"waiting for reference uploads: {counts[0]}/{expected} ready")
+            last_counts = counts
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(1.0)
+    raise GatewayError(
+        f"reference upload incomplete: {state.get('ready', 0)}/{expected} ready "
+        f"({state.get('attachments', 0)} thumbnails); prompt not submitted. "
+        "Check the ChatGPT upload controls or retry in a fresh chat.")
 
 
 # Composer file inputs to hand `chrome-use upload`, in order. ChatGPT reshuffled
@@ -2114,35 +2175,100 @@ _UPLOAD_SELECTORS = ("#upload-files", "form input[type=file]",
 def _upload_references(ab, session, ref_paths, remaining, emit) -> None:
     """Attach reference image files to the composer via `chrome-use upload`.
 
-    Tries `_UPLOAD_SELECTORS` in order so a composer reshuffle costs one selector
-    rather than a broken img2img, and re-raises the LAST failure when none work.
-    Waits for the thumbnail(s) to render so the caller's baseline capture counts
-    them as pre-existing — never mistaking a reference for the generated result.
+    Fall back only when a selector is definitely missing. After a possibly
+    dispatched upload, observe completion instead of uploading the batch again.
+    Every requested image must finish uploading before the prompt can be sent.
     """
+    if not ref_paths:
+        return
+    initial = _web_composer_state(ab, session, remaining)
+    if initial.get("text"):
+        raise GatewayError("ChatGPT composer is not empty; references not uploaded. "
+                           "Start a fresh chat to avoid mixing with an existing draft.")
+    if initial.get("attachments"):
+        raise GatewayError("ChatGPT composer already has attachments; use a fresh chat "
+                           "to avoid mixing or duplicating references")
     emit(f"attaching {len(ref_paths)} reference image(s)")
-    err: GatewayError | None = None
     for sel in _UPLOAD_SELECTORS:
         try:
             _ab(ab, "upload", sel, *ref_paths,
                 session=session, timeout=min(90.0, remaining()))
-            err = None
-            break
         except GatewayError as e:
-            err = e
-    if err is not None:
-        raise err
-    for _ in range(15):  # best-effort confirmation; proceed regardless
-        try:
-            n = _ab_eval(ab, _JS_PENDING_UPLOADS, session=session,
-                         timeout=min(10.0, remaining()))
-        except GatewayError:
-            n = 0
-        if isinstance(n, int) and n >= 1:
-            emit("reference attached")
-            time.sleep(2.0)  # let the upload finalise server-side before we send
-            return
+            state = _web_composer_state(ab, session, remaining)
+            missing = any(marker in str(e).lower() for marker in
+                          ("not found", "no element matches", "matched 0"))
+            if not state.get("attachments") and missing:
+                if sel == _UPLOAD_SELECTORS[-1]:
+                    raise
+                continue
+            if not state.get("attachments"):
+                raise GatewayError(f"reference upload outcome is uncertain; prompt not "
+                                   f"submitted and upload not repeated: {e}") from e
+        _wait_web_uploads(ab, session, len(ref_paths), remaining, emit)
+        return
+
+
+def _submit_web_prompt(ab, session, user_text, n_refs, remaining, emit) -> None:
+    """Paste, verify exact editor text and attachments, then click Send once.
+
+    `keyboard type` dispatches Enter for newlines and can submit several partial
+    messages. `fill --stdin` inserts paragraphs without any submit key events.
+    Never replay an uncertain send: a retry could consume quota twice.
+    """
+    initial = _web_composer_state(ab, session, remaining)
+    if initial.get("text"):
+        raise GatewayError("ChatGPT composer is not empty; prompt not submitted. "
+                           "Start a fresh chat to avoid overwriting an existing draft.")
+    emit("pasting prompt")
+    _ab(ab, "fill", "#prompt-textarea", "--stdin", input_text=user_text,
+        session=session, timeout=min(60.0, remaining()))
+    ready_deadline = time.monotonic() + min(30.0, remaining())
+    for _ in range(30):
+        state = _web_composer_state(ab, session, remaining)
+        if state.get("user_turns") != initial.get("user_turns"):
+            raise GatewayError("ChatGPT submitted while entering the prompt; "
+                               "stopped without sending again. Check the conversation.")
+        if state.get("text") != user_text:
+            raise GatewayError(
+                f"ChatGPT composer text differs from the supplied prompt "
+                f"(expected {len(user_text)} characters, got "
+                f"{len(state.get('text') or '')}); prompt not submitted.")
+        if state.get("attachments") != n_refs or state.get("ready") != n_refs:
+            raise GatewayError("ChatGPT attachments changed before sending; "
+                               "prompt not submitted. Check the reference uploads.")
+        if state.get("send_ready") and not state.get("busy"):
+            break
+        if time.monotonic() >= ready_deadline:
+            raise GatewayError("ChatGPT Send button did not become ready; prompt not submitted")
         time.sleep(1.0)
-    emit("warning: reference attachment not confirmed; submitting anyway")
+    else:
+        raise GatewayError("ChatGPT Send button did not become ready; prompt not submitted")
+    emit(f"verified prompt ({len(user_text)} characters) and {n_refs} reference image(s)")
+    send_error = None
+    try:
+        _ab(ab, "click", 'button[data-testid="send-button"]',
+            session=session, timeout=min(20.0, remaining()))
+    except GatewayError as error:
+        send_error = error
+    sent_deadline = time.monotonic() + min(30.0, remaining())
+    for _ in range(30):
+        try:
+            state = _web_composer_state(ab, session, remaining)
+        except GatewayError:
+            state = {}
+        new_turns = state.get("user_turns", 0) - initial.get("user_turns", 0)
+        if new_turns > 1:
+            raise GatewayError("multiple ChatGPT user messages appeared after Send; "
+                               "stopped without sending again. Check the conversation.")
+        if state.get("text") == "" and new_turns == 1:
+            emit("prompt submitted once")
+            return
+        if time.monotonic() >= sent_deadline:
+            break
+        time.sleep(1.0)
+    detail = f" ({send_error})" if send_error else ""
+    raise GatewayError("could not confirm ChatGPT received the prompt; Send was not "
+                       f"repeated to avoid duplicate requests{detail}. Check the conversation.")
 
 
 def _generate_in_browser(ab, session, user_text, args, deadline, remaining, emit,
@@ -2153,17 +2279,19 @@ def _generate_in_browser(ab, session, user_text, args, deadline, remaining, emit
     if refs:
         ref_paths: list[str] = []
         cleanups: list[str] = []
-        for r in refs:
-            path, cleanup = _resolve_ref_path(r)
-            ref_paths.append(path)
-            if cleanup:
-                cleanups.append(cleanup)
-        _upload_references(ab, session, ref_paths, remaining, emit)
-        for c in cleanups:
-            try:
-                os.unlink(c)
-            except OSError:
-                pass
+        try:
+            for r in refs:
+                path, cleanup = _resolve_ref_path(r)
+                ref_paths.append(path)
+                if cleanup:
+                    cleanups.append(cleanup)
+            _upload_references(ab, session, ref_paths, remaining, emit)
+        finally:
+            for c in cleanups:
+                try:
+                    os.unlink(c)
+                except OSError:
+                    pass
 
     # Capture the baseline set of image srcs already on the page so we never
     # mistake a prior image — INCLUDING a just-uploaded reference, whose src is
@@ -2173,49 +2301,7 @@ def _generate_in_browser(ab, session, user_text, args, deadline, remaining, emit
     if not isinstance(baseline, list):
         baseline = []
 
-    emit("submitting prompt")
-    # The composer is a ProseMirror/React contenteditable. `fill` mutates the
-    # DOM without firing the input events React listens for, so the send button
-    # stays bound to empty state and nothing submits. Real keystrokes via
-    # `keyboard type` go through ProseMirror's input path and update React, so
-    # both Enter and the send button then work.
-    _ab(ab, "click", "#prompt-textarea", session=session, timeout=min(20.0, remaining()))
-    _ab(ab, "keyboard", "type", user_text, session=session, timeout=min(60.0, remaining()))
-
-    def _composer_empty() -> bool:
-        # A sent message clears the composer; an empty composer is our proof the
-        # submit actually left the page (vs. a swallowed Enter leaving it stuck).
-        try:
-            return bool(_ab_eval(
-                ab,
-                "(() => { const t=(document.querySelector('#prompt-textarea')||{})"
-                ".textContent||''; return JSON.stringify(t.trim().length===0); })()",
-                session=session, timeout=min(15.0, remaining())))
-        except GatewayError:
-            return False
-
-    # Retry until the composer empties. With an attached reference the send button
-    # is briefly disabled while the upload finalises server-side, so the first
-    # Enter (or send click) can be swallowed — a single attempt would leave the
-    # prompt stuck in the box and the poll below would hang until timeout.
-    sent = False
-    for _ in range(6):
-        _ab(ab, "press", "Enter", session=session, timeout=min(20.0, remaining()))
-        time.sleep(1.0)
-        if _composer_empty():
-            sent = True
-            break
-        try:
-            _ab(ab, "click", 'button[data-testid="send-button"]',
-                session=session, timeout=min(15.0, remaining()))
-        except GatewayError:
-            pass
-        time.sleep(1.5)
-        if _composer_empty():
-            sent = True
-            break
-    if not sent:
-        emit("warning: composer did not clear — the prompt may not have sent")
+    _submit_web_prompt(ab, session, user_text, len(refs or []), remaining, emit)
 
     # Poll until the stream stops AND a brand-new image asset is present and
     # stable across two reads (guards against grabbing a mid-render partial).
