@@ -2101,6 +2101,7 @@ class ApplyPackageMalformed(unittest.TestCase):
 
 
 def _composer_state(text="", attachments=0, ready=None, **kw):
+    """Build a simulated ChatGPT composer state with optional field overrides."""
     return {"exists": True, "text": text, "attachments": attachments,
             "ready": attachments if ready is None else ready, "busy": False,
             "send_ready": True, "user_turns": 0, **kw}
@@ -2120,6 +2121,7 @@ class UploadReferences(unittest.TestCase):
         uploaded = False
 
         def fake_ab(ab, *args, session=None, timeout=None, profile=None):
+            """Simulate missing upload selectors and report successful attachments."""
             nonlocal uploaded
             if args[0] == "upload":
                 tried.append(args[1])
@@ -2136,24 +2138,29 @@ class UploadReferences(unittest.TestCase):
         return tried, emitted
 
     def test_uses_current_composer_input_first(self):
+        """Prefer the current ChatGPT file input and confirm its upload."""
         tried, emitted = self._run(fail_selectors=())
         self.assertEqual(tried, ["#upload-files"])
         self.assertIn("all 1 reference image(s) uploaded", emitted)
 
     def test_falls_back_to_next_selector(self):
+        """Try the next upload selector when the preferred input is missing."""
         tried, _ = self._run(fail_selectors=("#upload-files",))
         self.assertEqual(tried, ["#upload-files", "form input[type=file]"])
 
     def test_reraises_last_error_when_all_selectors_fail(self):
+        """Expose the final selector error when no upload input can be found."""
         with self.assertRaises(cig.GatewayError) as cm:
             self._run(fail_selectors=tuple(cig._UPLOAD_SELECTORS))
         self.assertIn(cig._UPLOAD_SELECTORS[-1], str(cm.exception))
 
     def test_legacy_selector_is_still_last_resort(self):
+        """Keep the image-only input selector available for older composers."""
         # Old DOMs exposed only input[accept="image/*"]; keep them working.
         self.assertIn('input[accept="image/*"]', cig._UPLOAD_SELECTORS)
 
     def test_waits_for_all_five_server_backed_images(self):
+        """Wait for all five uploads and pending processing without re-uploading."""
         states = [_composer_state(), _composer_state(attachments=1, ready=0),
                   _composer_state(attachments=5, ready=1),
                   _composer_state(attachments=5, ready=4),
@@ -2167,6 +2174,7 @@ class UploadReferences(unittest.TestCase):
                                    session="s", timeout=90.0)
 
     def test_partial_or_unconfirmed_upload_never_proceeds(self):
+        """Reject batches with missing thumbnails or unfinished server uploads."""
         for state in (_composer_state(), _composer_state(attachments=1),
                       _composer_state(attachments=5, ready=4)):
             with self.subTest(state=state), \
@@ -2180,6 +2188,7 @@ class UploadReferences(unittest.TestCase):
                 ab.assert_called_once()
 
     def test_upload_error_after_dispatch_does_not_duplicate_images(self):
+        """Observe an upload that started before an error instead of repeating it."""
         with unittest.mock.patch.object(cig, "_web_composer_state", side_effect=[
                  _composer_state(), _composer_state(attachments=2), _composer_state(attachments=5)]), \
              unittest.mock.patch.object(cig, "_ab", side_effect=cig.GatewayError("timed out")) as ab:
@@ -2187,6 +2196,7 @@ class UploadReferences(unittest.TestCase):
         ab.assert_called_once()
 
     def test_uncertain_upload_with_no_thumbnails_is_not_replayed(self):
+        """Avoid replaying a timed-out upload whose outcome cannot be verified."""
         with unittest.mock.patch.object(cig, "_web_composer_state", return_value=_composer_state()), \
              unittest.mock.patch.object(cig, "_ab", side_effect=cig.GatewayError("timed out")) as ab:
             with self.assertRaisesRegex(cig.GatewayError, "outcome is uncertain"):
@@ -2194,6 +2204,7 @@ class UploadReferences(unittest.TestCase):
         ab.assert_called_once()
 
     def test_preexisting_and_duplicate_attachments_are_rejected(self):
+        """Reject existing or excess attachments to prevent mixed reference sets."""
         for states in ([_composer_state(attachments=1)],
                        [_composer_state(), _composer_state(attachments=6)]):
             with self.subTest(states=states), \
@@ -2204,6 +2215,7 @@ class UploadReferences(unittest.TestCase):
                 self.assertLessEqual(ab.call_count, 1)
 
     def test_existing_draft_stops_before_upload(self):
+        """Preserve an existing draft by stopping before any reference upload."""
         with unittest.mock.patch.object(cig, "_web_composer_state",
                  return_value=_composer_state("existing draft")), \
              unittest.mock.patch.object(cig, "_ab") as ab:
@@ -2213,10 +2225,14 @@ class UploadReferences(unittest.TestCase):
 
 
 class WebPromptSubmission(unittest.TestCase):
+    """Verify exact prompt entry and one confirmed send using simulated Chrome."""
+
     def _run(self, states, prompt="first\n\n猫 🦊\nlast\n", send_error=False):
+        """Run submission against supplied states and record browser commands."""
         self.calls = []
 
         def ab(*args, **kw):
+            """Record browser calls and optionally simulate an uncertain Send."""
             self.calls.append((args, kw))
             if send_error and args[1] == "click":
                 raise cig.GatewayError("click outcome unknown")
@@ -2229,6 +2245,7 @@ class WebPromptSubmission(unittest.TestCase):
             cig._submit_web_prompt("ab", "s", prompt, 5, lambda: 90, lambda _: None)
 
     def test_long_multiline_prompt_uses_stdin_and_one_click(self):
+        """Preserve a long Unicode prompt through stdin and click Send once."""
         prompt = (" \tParagraph — 猫, 'quotes', $(), `code`.\n\n" * 4000) + "end\n"
         self._run([_composer_state(attachments=5),
                    _composer_state(prompt, attachments=5, send_ready=False),
@@ -2240,6 +2257,7 @@ class WebPromptSubmission(unittest.TestCase):
         self.assertEqual(self.calls[1][0][1:], ("click", 'button[data-testid="send-button"]'))
 
     def test_changed_text_attachments_or_early_submission_prevents_send(self):
+        """Stop before Send if prompt text, reference state, or user turns change."""
         prompt = "first\n\n猫 🦊\nlast\n"
         bad = [_composer_state(prompt.replace("\n", ""), attachments=5),
                _composer_state(prompt, attachments=4),
@@ -2251,11 +2269,13 @@ class WebPromptSubmission(unittest.TestCase):
             self.assertEqual([a[1] for a, _ in self.calls], ["fill"])
 
     def test_existing_draft_is_not_overwritten(self):
+        """Leave an existing composer draft untouched without issuing commands."""
         with self.assertRaisesRegex(cig.GatewayError, "not empty"):
             self._run([_composer_state("existing draft", attachments=5)])
         self.assertEqual(self.calls, [])
 
     def test_disabled_send_button_never_gets_clicked(self):
+        """Fail without clicking when the Send button remains disabled."""
         prompt = "first\n\n猫 🦊\nlast\n"
         with self.assertRaisesRegex(cig.GatewayError, "did not become ready"):
             self._run([_composer_state(attachments=5),
@@ -2263,6 +2283,7 @@ class WebPromptSubmission(unittest.TestCase):
         self.assertEqual(len(self.calls), 1)
 
     def test_ambiguous_send_is_checked_without_replaying(self):
+        """Confirm a message after an uncertain click without sending again."""
         prompt = "first\n\n猫 🦊\nlast\n"
         self._run([_composer_state(attachments=5),
                    _composer_state(prompt, attachments=5),
@@ -2271,6 +2292,7 @@ class WebPromptSubmission(unittest.TestCase):
         self.assertEqual(len(self.calls), 2)
 
     def test_empty_composer_alone_is_not_proof_of_submission(self):
+        """Require a new user message as well as an empty composer after Send."""
         prompt = "first\n\n猫 🦊\nlast\n"
         with self.assertRaisesRegex(cig.GatewayError, "Send was not repeated"):
             self._run([_composer_state(attachments=5),
@@ -2278,6 +2300,7 @@ class WebPromptSubmission(unittest.TestCase):
         self.assertEqual(len(self.calls), 2)
 
     def test_multiple_user_turns_are_reported_without_another_send(self):
+        """Report unexpected multiple messages without attempting another send."""
         prompt = "first\n\n猫 🦊\nlast\n"
         with self.assertRaisesRegex(cig.GatewayError, "multiple ChatGPT user messages"):
             self._run([_composer_state(attachments=5),
@@ -2285,6 +2308,7 @@ class WebPromptSubmission(unittest.TestCase):
         self.assertEqual(len(self.calls), 2)
 
     def test_ab_passes_prompt_on_stdin_without_adding_it_to_argv(self):
+        """Pass prompt text as subprocess input rather than a command argument."""
         prompt = "long\n\n猫\n"
         result = argparse.Namespace(returncode=0, stdout="done")
         with unittest.mock.patch.object(cig.subprocess, "run", return_value=result) as run:
@@ -2294,6 +2318,7 @@ class WebPromptSubmission(unittest.TestCase):
         self.assertNotIn(prompt, run.call_args.args[0])
 
     def test_failed_upload_cleans_downloads_and_never_types(self):
+        """Remove temporary reference downloads and skip typing after upload failure."""
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "download.png"
             path.write_bytes(b"test")
