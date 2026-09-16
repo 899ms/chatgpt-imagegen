@@ -25,7 +25,9 @@ image-use --backend web
    ├── chrome-use open https://chatgpt.com/      (a *regular* chat — Temporary Chat disables the image tool)
    ├── resolve the ChatGPT Project (--project)    (in-page fetch: list via gizmos/snorlax/sidebar,
    │   and open chatgpt.com/g/<g-p-id>/project     create via POST /backend-api/projects if absent)
-   ├── type the prompt with real keystrokes        (ProseMirror/React composer ignores DOM-only `fill`)
+   ├── paste the prompt via stdin                 (newlines never act as Send)
+   ├── verify exact editor text + all uploads     (stop if incomplete or changed)
+   ├── click Send once and confirm a new message  (never replay an uncertain send)
    ├── poll the page: wait until streaming stops AND a new <img> asset is stable
    └── fetch the asset bytes in-page (credentials:'include') → base64 → save
        (the signed estuary/content URL is authorized by the browser's own cookies)
