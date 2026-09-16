@@ -109,6 +109,12 @@ needs [libwebp](https://developers.google.com/speed/webp/download) (`img2webp`).
 
 Full options: `image-use --help`. → **[Generate images](https://drawstyle.leeguoo.com/en/docs/generate)** · **[Styles](https://drawstyle.leeguoo.com/en/docs/styles)**
 
+The ChatGPT browser backend pastes multiline prompts, checks the exact editor
+text, and waits for every reference upload to finish before clicking Send once.
+Incomplete uploads or altered text stop the run. If a send cannot be confirmed,
+it reports the uncertainty without sending again. Start with an empty composer;
+an existing draft is preserved.
+
 ## Community styles
 
 Browse and reuse art styles other people tuned — a public gallery at **[drawstyle.leeguoo.com](https://drawstyle.leeguoo.com)**. No script update needed:
