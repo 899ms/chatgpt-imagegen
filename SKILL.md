@@ -1,6 +1,6 @@
 ---
 name: "image-use"
-version: "0.29.0"
+version: "0.29.1"
 description: >-
   Backend-neutral image generation: create new raster images and looping
   GIF/WebP animations through the local one-file image-use CLI (formerly
@@ -10,9 +10,8 @@ description: >-
   画图, 画一张, 生成图片, 生图, 配图. Use for photos, illustrations, icons, hero banners,
   mockups, sprites, concept art, animation loops, and figures for documents,
   proposals, blog posts, or READMEs; save outputs in the workspace. Auto mode
-  prefers the logged-in ChatGPT browser through chrome-use to avoid Codex usage
-  and falls back to the Codex backend only when the web path is unavailable.
-  Users with a Gemini subscription can name --backend gemini or agy instead.
+  uses the logged-in ChatGPT browser via chrome-use. Gemini users can pass
+  --backend gemini or agy.
   Proactively propose useful figures while authoring long-form content. Do not
   use for editing existing images, SVG/vector work, code-native graphics,
   established icon systems, explicit high-quality or transparent API output,

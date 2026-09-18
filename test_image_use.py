@@ -3189,5 +3189,21 @@ class _Escape(Exception):
     """Sentinel used to break out of the slot poll loop under test."""
 
 
+class SkillManifestTests(unittest.TestCase):
+    def _frontmatter(self):
+        text = (Path(__file__).parent / "SKILL.md").read_text(encoding="utf-8")
+        return text.split("---", 2)[1]
+
+    def test_description_within_pi_limit(self):
+        m = re.search(r"^description: >-\n((?:  .*\n)+)", self._frontmatter(), re.M)
+        self.assertIsNotNone(m)
+        desc = " ".join(line.strip() for line in m.group(1).splitlines())
+        self.assertLessEqual(len(desc), 1024)
+
+    def test_version_matches_cli(self):
+        m = re.search(r'^version: "([^"]+)"', self._frontmatter(), re.M)
+        self.assertEqual(m.group(1), cig.__version__)
+
+
 if __name__ == "__main__":
     unittest.main()
