@@ -2269,6 +2269,19 @@ class WebPromptSubmission(unittest.TestCase):
             # The second fill clears the draft we pasted; Send is never clicked.
             self.assertEqual([a[1] for a, _ in self.calls], ["fill", "fill"])
 
+    def test_editor_whitespace_equivalents_still_send(self):
+        """Accept CRLF and NBSP the editor substitutes, but no other drift."""
+        prompt = "  indented\r\nnext\rlast\n"
+        shown = "\u00a0 indented\nnext\nlast\n"
+        self._run([_composer_state(attachments=5),
+                   _composer_state(shown, attachments=5),
+                   _composer_state(shown, attachments=5),
+                   _composer_state(user_turns=1)], prompt)
+        self.assertEqual([a[1] for a, _ in self.calls], ["fill", "click"])
+        with self.assertRaises(cig.GatewayError):
+            self._run([_composer_state(attachments=5),
+                       _composer_state(shown.replace("next", "nxet"), attachments=5)], prompt)
+
     def test_existing_draft_is_not_overwritten(self):
         """Leave an existing composer draft untouched without issuing commands."""
         with self.assertRaisesRegex(cig.GatewayError, "not empty"):
